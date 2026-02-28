@@ -9,7 +9,9 @@ llm_build_step35_iswa::llm_build_step35_iswa(const llama_model & model, const ll
     auto        * inp_attn    = build_attn_inp_kv_iswa();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    const int n_layer_main = n_layer - (int) hparams.nextn_predict_layers;
+
+    for (int il = 0; il < n_layer_main; ++il) {
         ggml_tensor * inpSA = inpL;
 
         const uint32_t n_head_l    = hparams.n_head(il);
@@ -96,7 +98,7 @@ llm_build_step35_iswa::llm_build_step35_iswa(const llama_model & model, const ll
             cb(cur, "attn_proj", il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer_main - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }

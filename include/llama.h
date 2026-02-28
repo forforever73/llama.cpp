@@ -315,6 +315,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool mtp;             // enable multi-token prediction (load MTP weights)
     };
 
     struct llama_sampler_seq_config {

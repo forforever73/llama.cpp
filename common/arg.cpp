@@ -1279,6 +1279,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SWA_FULL"));
     add_opt(common_arg(
+        {"-mtp", "--multi-token-prediction"},
+        "enable multi-token prediction (load MTP weights)",
+        [](common_params & params) {
+            params.mtp = true;
+        }
+    ).set_env("LLAMA_ARG_MTP"));
+    add_opt(common_arg(
         {"--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("max number of context checkpoints to create per slot (default: %d)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
