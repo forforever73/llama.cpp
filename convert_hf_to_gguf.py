@@ -8300,20 +8300,11 @@ class Step35Model(TextModel):
             if il >= n_main:
                 name = name.replace(f"model.layers.{il}.transformer.", f"model.layers.{il}.")
 
-                if "enorm" in name:
-                    name = name.replace("enorm", "nextn.enorm")
-                elif "hnorm" in name:
-                    name = name.replace("hnorm", "nextn.hnorm")
-                elif "eh_proj" in name:
-                    name = name.replace("eh_proj", "nextn.eh_proj")
-                elif "shared_head.norm" in name:
-                    name = name.replace("shared_head.norm", "nextn.shared_head_norm")
-                elif "shared_head.output" in name:
-                    name = name.replace("shared_head.output", "nextn.shared_head_head")
+                if "shared_head.output" in name:
+                    name = name.replace("shared_head.output", "shared_head.head")
                 elif "embed_tokens" in name:
                     if il > n_main:
                         return
-                    name = name.replace("embed_tokens", "nextn.embed_tokens")
 
         if name.endswith("norm.weight"):
             data_torch += 1.0
