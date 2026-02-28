@@ -8298,6 +8298,8 @@ class Step35Model(TextModel):
         if (m := re.match(r"model\.layers\.(\d+)\.", name)) is not None:
             il = int(m.group(1))
             if il >= n_main:
+                name = name.replace(f"model.layers.{il}.transformer.", f"model.layers.{il}.")
+
                 if "enorm" in name:
                     name = name.replace("enorm", "nextn.enorm")
                 elif "hnorm" in name:
