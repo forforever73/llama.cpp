@@ -328,3 +328,12 @@ const llama_kv_cache_context * llama_kv_cache_iswa_context::get_swa()  const {
 
     return static_cast<const llama_kv_cache_context *>(ctx_swa.get());
 }
+
+void llama_kv_cache_iswa_context::set_inplace(bool value) {
+    auto * base = const_cast<llama_kv_cache_context *>(
+            static_cast<const llama_kv_cache_context *>(ctx_base.get()));
+    auto * swa  = const_cast<llama_kv_cache_context *>(
+            static_cast<const llama_kv_cache_context *>(ctx_swa.get()));
+    if (base) { base->set_inplace(value); }
+    if (swa)  { swa ->set_inplace(value); }
+}

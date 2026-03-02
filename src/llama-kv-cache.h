@@ -182,7 +182,8 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    // when is_inplace is true, only writes KV tensor data, does not modify cell metadata
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool is_inplace = false);
 
     //
     // input API
@@ -353,6 +354,10 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    const slot_info_vec_t & get_sinfos() const { return sinfos; }
+
+    void set_inplace(bool value) { is_inplace = value; }
+
 private:
     llama_memory_status status;
 
@@ -377,6 +382,8 @@ private:
     slot_info_vec_t sinfos;
 
     std::vector<llama_ubatch> ubatches;
+
+    bool is_inplace = false;
 
     //
     // data needed for building the compute graph for the current ubatch:

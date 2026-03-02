@@ -122,6 +122,8 @@ public:
     const llama_kv_cache_context * get_base() const;
     const llama_kv_cache_context * get_swa()  const;
 
+    void set_inplace(bool value);
+
 private:
     //llama_kv_cache_iswa * kv;
 

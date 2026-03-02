@@ -194,6 +194,13 @@ extern "C" {
         LLAMA_SPLIT_MODE_ROW   = 2, // split layers and KV across GPUs, use tensor parallelism if supported
     };
 
+    enum llama_mtp_op_type {
+        LLAMA_MTP_OP_NONE            = 0,
+        LLAMA_MTP_OP_WARMUP          = 1,
+        LLAMA_MTP_OP_DRAFT_GEN       = 2,
+        LLAMA_MTP_OP_UPDATE_ACCEPTED = 3,
+    };
+
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -955,6 +962,14 @@ extern "C" {
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
+
+    // MTP (Multi-Token Prediction) API
+    LLAMA_API void llama_set_mtp_op_type(struct llama_context * ctx, enum llama_mtp_op_type op);
+    LLAMA_API void llama_set_mtp_layer_idx(struct llama_context * ctx, int32_t layer_idx);
+    LLAMA_API void llama_set_mtp_hidden_state(struct llama_context * ctx, const float * data, int32_t n_tokens);
+    LLAMA_API void llama_mtp_prepare_sinfo_for_warmup(struct llama_context * ctx);
+    LLAMA_API void llama_mtp_prepare_sinfo_for_update(struct llama_context * ctx, int32_t n_accepted);
+    LLAMA_API void llama_mtp_cancel_sinfo_update(struct llama_context * ctx);
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);

@@ -105,6 +105,14 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    void set_mtp_op_type(llama_mtp_op_type op);
+    void set_mtp_layer_idx(int32_t layer_idx);
+    void set_mtp_hidden_state(const float * data, int32_t n_tokens);
+
+    void mtp_prepare_sinfo_for_warmup();
+    void mtp_prepare_sinfo_for_update(int32_t n_accepted);
+    void mtp_cancel_sinfo_update();
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -334,6 +342,16 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // MTP state
+    llama_mtp_op_type       mtp_op_type       = LLAMA_MTP_OP_NONE;
+    int32_t                 mtp_layer_idx     = -1;
+    std::vector<float>      mtp_hidden_state;
+    int32_t                 mtp_hidden_n_tokens = 0;
+
+    // KV cache alignment: saved sinfos from last main model decode
+    bool has_last_main_sinfos = false;
+    bool has_forced_sinfos    = false;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

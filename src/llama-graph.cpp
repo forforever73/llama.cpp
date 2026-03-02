@@ -313,6 +313,14 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_mtp_hidden_state::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    if (hidden_state && data) {
+        ggml_backend_tensor_set(hidden_state, data, 0, ggml_nbytes(hidden_state));
+    }
+}
+
 void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -877,6 +885,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    mtp_op_type      (params.mtp_op_type),
+    mtp_layer_idx    (params.mtp_layer_idx),
+    mtp_hidden_state (params.mtp_hidden_state),
+    mtp_rope_freq_base(params.mtp_rope_freq_base),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1625,6 +1637,19 @@ ggml_tensor * llm_graph_context::build_inp_cls() const {
     auto & cur = inp->cls;
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_seqs_unq);
+    ggml_set_input(cur);
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_mtp_hidden_state() const {
+    auto inp = std::make_unique<llm_graph_input_mtp_hidden_state>(mtp_hidden_state);
+
+    auto & cur = inp->hidden_state;
+
+    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
     ggml_set_input(cur);
 
     res->add_input(std::move(inp));

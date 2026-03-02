@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -974,6 +975,44 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_mtp_op_type(llama_mtp_op_type op) {
+    mtp_op_type = op;
+}
+
+void llama_context::set_mtp_layer_idx(int32_t layer_idx) {
+    mtp_layer_idx = layer_idx;
+}
+
+void llama_context::set_mtp_hidden_state(const float * data, int32_t n_tokens) {
+    const int64_t n_embd = model.hparams.n_embd;
+    mtp_hidden_state.resize(n_embd * n_tokens);
+    mtp_hidden_n_tokens = n_tokens;
+    if (data) {
+        memcpy(mtp_hidden_state.data(), data, n_embd * n_tokens * sizeof(float));
+    }
+}
+
+void llama_context::mtp_prepare_sinfo_for_warmup() {
+    if (!has_last_main_sinfos) {
+        LLAMA_LOG_WARN("%s: no saved main sinfos, MTP warmup will use normal slot allocation\n", __func__);
+        return;
+    }
+    has_forced_sinfos = true;
+}
+
+void llama_context::mtp_prepare_sinfo_for_update(int32_t n_accepted) {
+    GGML_UNUSED(n_accepted);
+    if (!has_last_main_sinfos) {
+        LLAMA_LOG_WARN("%s: no saved main sinfos, MTP update will use normal slot allocation\n", __func__);
+        return;
+    }
+    has_forced_sinfos = true;
+}
+
+void llama_context::mtp_cancel_sinfo_update() {
+    has_forced_sinfos = false;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1549,6 +1588,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
+    // MTP warmup/accept: set is_inplace to skip cell metadata updates
+    if (has_forced_sinfos &&
+            (mtp_op_type == LLAMA_MTP_OP_WARMUP || mtp_op_type == LLAMA_MTP_OP_UPDATE_ACCEPTED)) {
+        auto * iswa_ctx = dynamic_cast<llama_kv_cache_iswa_context *>(mctx.get());
+        if (iswa_ctx) {
+            iswa_ctx->set_inplace(true);
+        }
+    }
+
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
@@ -1622,8 +1670,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
             t_embd = res->get_embd_pooled();
         }
 
+        const bool mtp_skip_output = (mtp_op_type == LLAMA_MTP_OP_WARMUP || mtp_op_type == LLAMA_MTP_OP_UPDATE_ACCEPTED);
+
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (!mtp_skip_output && logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -1638,7 +1688,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract embeddings
-        if (embd.data && t_embd && n_outputs > 0) {
+        if (!mtp_skip_output && embd.data && t_embd && n_outputs > 0) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -1708,6 +1758,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
     } while (mctx->next());
+
+    // save sinfos from main model decode for MTP KV alignment
+    if (mtp_op_type == LLAMA_MTP_OP_NONE && model.hparams.nextn_predict_layers > 0) {
+        has_last_main_sinfos = true;
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2033,22 +2088,34 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    llm_mtp_op_type mtp_op = LLM_MTP_OP_NONE;
+    switch (mtp_op_type) {
+        case LLAMA_MTP_OP_NONE:            mtp_op = LLM_MTP_OP_NONE;            break;
+        case LLAMA_MTP_OP_WARMUP:          mtp_op = LLM_MTP_OP_WARMUP;          break;
+        case LLAMA_MTP_OP_DRAFT_GEN:       mtp_op = LLM_MTP_OP_DRAFT_GEN;       break;
+        case LLAMA_MTP_OP_UPDATE_ACCEPTED: mtp_op = LLM_MTP_OP_UPDATE_ACCEPTED; break;
+    }
+
     return {
-        /*.arch        =*/ model.arch,
-        /*.hparams     =*/ model.hparams,
-        /*.cparams     =*/ cparams,
-        /*.ubatch      =*/ ubatch,
-        /*.gtype       =*/ gtype,
-        /*.sched       =*/ sched.get(),
-        /*.backend_cpu =*/ backend_cpu,
-        /*.cvec        =*/ cvec.get(),
-        /*.loras       =*/ loras.get(),
-        /*.mctx        =*/ mctx,
-        /*.cross       =*/ &cross,
-        /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
+        /*.arch               =*/ model.arch,
+        /*.hparams            =*/ model.hparams,
+        /*.cparams            =*/ cparams,
+        /*.ubatch             =*/ ubatch,
+        /*.gtype              =*/ gtype,
+        /*.sched              =*/ sched.get(),
+        /*.backend_cpu        =*/ backend_cpu,
+        /*.cvec               =*/ cvec.get(),
+        /*.loras              =*/ loras.get(),
+        /*.mctx               =*/ mctx,
+        /*.cross              =*/ &cross,
+        /*.mtp_op_type        =*/ mtp_op,
+        /*.mtp_layer_idx      =*/ mtp_layer_idx,
+        /*.mtp_hidden_state   =*/ mtp_hidden_state.empty() ? nullptr : mtp_hidden_state.data(),
+        /*.mtp_rope_freq_base =*/ model.hparams.rope_freq_base_train_swa,
+        /*.samplers           =*/ sampling.samplers,
+        /*.n_outputs          =*/ n_outputs,
+        /*.cb                 =*/ graph_get_cb(),
+        /*.res                =*/ res,
     };
 }
 
@@ -2945,6 +3012,30 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_mtp_op_type(llama_context * ctx, llama_mtp_op_type op) {
+    ctx->set_mtp_op_type(op);
+}
+
+void llama_set_mtp_layer_idx(llama_context * ctx, int32_t layer_idx) {
+    ctx->set_mtp_layer_idx(layer_idx);
+}
+
+void llama_set_mtp_hidden_state(llama_context * ctx, const float * data, int32_t n_tokens) {
+    ctx->set_mtp_hidden_state(data, n_tokens);
+}
+
+void llama_mtp_prepare_sinfo_for_warmup(llama_context * ctx) {
+    ctx->mtp_prepare_sinfo_for_warmup();
+}
+
+void llama_mtp_prepare_sinfo_for_update(llama_context * ctx, int32_t n_accepted) {
+    ctx->mtp_prepare_sinfo_for_update(n_accepted);
+}
+
+void llama_mtp_cancel_sinfo_update(llama_context * ctx) {
+    ctx->mtp_cancel_sinfo_update();
 }
 
 void llama_synchronize(llama_context * ctx) {
