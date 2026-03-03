@@ -224,7 +224,7 @@ struct server_slot {
         GGML_ASSERT(task);
 
         return
-            !task->need_embd() ||
+            !need_embd() ||
             (llama_get_memory(ctx) && llama_pooling_type(ctx) == LLAMA_POOLING_TYPE_LAST);
     }
 
@@ -258,6 +258,16 @@ struct server_slot {
 
     bool can_speculate() const {
         return !!spec;
+    }
+
+    bool need_embd() const {
+        if (!task) {
+            return false;
+        }
+        if (task->need_embd()) {
+            return true;
+        }
+        return spec && task->params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
     }
 
     void add_token(const completion_token_output & token) {
@@ -2508,7 +2518,7 @@ private:
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
-                            slot.task->need_embd());
+                            slot.need_embd());
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -2599,7 +2609,7 @@ private:
                 slot_batched->lora[alora_disabled_id].scale = alora_scale;
             }
 
-            llama_set_embeddings(ctx, slot_batched->task->need_embd());
+            llama_set_embeddings(ctx, slot_batched->need_embd());
         }
 
         if (batch.n_tokens == 0) {
