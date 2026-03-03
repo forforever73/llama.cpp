@@ -1525,7 +1525,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    const bool is_mtp_inplace = use_forced_sinfos &&
+        (mtp_op_type == LLAMA_MTP_OP_WARMUP || mtp_op_type == LLAMA_MTP_OP_UPDATE_ACCEPTED);
+    const llama_memory_i * memory_for_batch = is_mtp_inplace ? nullptr : memory.get();
+
+    if (!balloc->init(batch_inp, vocab, memory_for_batch, n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
