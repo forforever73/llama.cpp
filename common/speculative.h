@@ -27,6 +27,9 @@ void common_speculative_free(common_speculative * spec);
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
 
+// update MTP KV cache for a batch using current context embeddings
+void mtp_update_kv_cache(llama_context * ctx, const llama_batch & batch, bool is_warmup);
+
 // sample up to n_draft tokens and add them to the batch using the draft model
 llama_tokens common_speculative_draft(
                      common_speculative * spec,

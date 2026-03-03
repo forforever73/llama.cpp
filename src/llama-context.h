@@ -108,10 +108,10 @@ struct llama_context {
 
     void set_mtp_op_type(llama_mtp_op_type op);
     void set_mtp_layer_idx(int32_t layer_idx);
-    void set_mtp_hidden_state(const float * data, int32_t n_tokens);
+    void set_draft_input_hidden_state(const float * hidden_state);
 
-    void mtp_prepare_sinfo_for_warmup();
-    void mtp_prepare_sinfo_for_update(int32_t n_accepted);
+    bool mtp_prepare_sinfo_for_warmup();
+    bool mtp_prepare_sinfo_for_update(int32_t n_accepted);
     void mtp_cancel_sinfo_update();
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -348,8 +348,7 @@ private:
     // MTP state
     llama_mtp_op_type       mtp_op_type       = LLAMA_MTP_OP_NONE;
     int32_t                 mtp_layer_idx     = -1;
-    std::vector<float>      mtp_hidden_state;
-    int32_t                 mtp_hidden_n_tokens = 0;
+    const float *           draft_input_hidden_state = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

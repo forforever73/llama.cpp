@@ -969,9 +969,9 @@ extern "C" {
     // MTP (Multi-Token Prediction) API
     LLAMA_API void llama_set_mtp_op_type(struct llama_context * ctx, enum llama_mtp_op_type op);
     LLAMA_API void llama_set_mtp_layer_idx(struct llama_context * ctx, int32_t layer_idx);
-    LLAMA_API void llama_set_mtp_hidden_state(struct llama_context * ctx, const float * data, int32_t n_tokens);
-    LLAMA_API void llama_mtp_prepare_sinfo_for_warmup(struct llama_context * ctx);
-    LLAMA_API void llama_mtp_prepare_sinfo_for_update(struct llama_context * ctx, int32_t n_accepted);
+    LLAMA_API void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state);
+    LLAMA_API bool llama_mtp_prepare_sinfo_for_warmup(struct llama_context * ctx);
+    LLAMA_API bool llama_mtp_prepare_sinfo_for_update(struct llama_context * ctx, int32_t n_accepted);
     LLAMA_API void llama_mtp_cancel_sinfo_update(struct llama_context * ctx);
 
     // Set abort callback

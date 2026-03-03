@@ -991,30 +991,26 @@ void llama_context::set_mtp_layer_idx(int32_t layer_idx) {
     mtp_layer_idx = layer_idx;
 }
 
-void llama_context::set_mtp_hidden_state(const float * data, int32_t n_tokens) {
-    const int64_t n_embd = model.hparams.n_embd;
-    mtp_hidden_state.resize(n_embd * n_tokens);
-    mtp_hidden_n_tokens = n_tokens;
-    if (data) {
-        memcpy(mtp_hidden_state.data(), data, n_embd * n_tokens * sizeof(float));
-    }
+void llama_context::set_draft_input_hidden_state(const float * hidden_state) {
+    draft_input_hidden_state = hidden_state;
 }
 
-void llama_context::mtp_prepare_sinfo_for_warmup() {
+bool llama_context::mtp_prepare_sinfo_for_warmup() {
     const auto & last_sinfo = kv_cache_data->last_main_model_sinfos;
     if (last_sinfo.empty()) {
         LLAMA_LOG_ERROR("%s: The main call sinfo is not available for warmup.\n", __func__);
-        return;
+        return false;
     }
 
     kv_cache_data->forced_sinfos = &last_sinfo;
+    return true;
 }
 
-void llama_context::mtp_prepare_sinfo_for_update(int32_t n_accepted) {
+bool llama_context::mtp_prepare_sinfo_for_update(int32_t n_accepted) {
     const auto & last_sinfo = kv_cache_data->last_main_model_sinfos;
     if (last_sinfo.empty() || last_sinfo[0].idxs.empty()) {
         LLAMA_LOG_ERROR("%s: The sinfo for the last main call is not available.\n", __func__);
-        return;
+        return false;
     }
 
     kv_cache_data->resized_sinfo_for_force = last_sinfo;
@@ -1026,6 +1022,7 @@ void llama_context::mtp_prepare_sinfo_for_update(int32_t n_accepted) {
     idxs.resize(std::min(idxs.size(), (size_t) n_accepted));
 
     kv_cache_data->forced_sinfos = &kv_cache_data->resized_sinfo_for_force;
+    return true;
 }
 
 void llama_context::mtp_cancel_sinfo_update() {
@@ -2139,6 +2136,13 @@ llm_graph_params llama_context::graph_params(
         case LLAMA_MTP_OP_UPDATE_ACCEPTED: mtp_op = LLM_MTP_OP_UPDATE_ACCEPTED; break;
     }
 
+    const float * mtp_hidden = nullptr;
+    if (mtp_op_type == LLAMA_MTP_OP_DRAFT_GEN) {
+        mtp_hidden = draft_input_hidden_state;
+    } else if (mtp_op_type == LLAMA_MTP_OP_WARMUP || mtp_op_type == LLAMA_MTP_OP_UPDATE_ACCEPTED) {
+        mtp_hidden = embd.data;
+    }
+
     return {
         /*.arch               =*/ model.arch,
         /*.hparams            =*/ model.hparams,
@@ -2153,7 +2157,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross              =*/ &cross,
         /*.mtp_op_type        =*/ mtp_op,
         /*.mtp_layer_idx      =*/ mtp_layer_idx,
-        /*.mtp_hidden_state   =*/ mtp_hidden_state.empty() ? nullptr : mtp_hidden_state.data(),
+        /*.mtp_hidden_state   =*/ mtp_hidden,
         /*.mtp_rope_freq_base =*/ model.hparams.rope_freq_base_train_swa,
         /*.samplers           =*/ sampling.samplers,
         /*.n_outputs          =*/ n_outputs,
@@ -3065,16 +3069,16 @@ void llama_set_mtp_layer_idx(llama_context * ctx, int32_t layer_idx) {
     ctx->set_mtp_layer_idx(layer_idx);
 }
 
-void llama_set_mtp_hidden_state(llama_context * ctx, const float * data, int32_t n_tokens) {
-    ctx->set_mtp_hidden_state(data, n_tokens);
+void llama_set_draft_input_hidden_state(llama_context * ctx, const float * hidden_state) {
+    ctx->set_draft_input_hidden_state(hidden_state);
 }
 
-void llama_mtp_prepare_sinfo_for_warmup(llama_context * ctx) {
-    ctx->mtp_prepare_sinfo_for_warmup();
+bool llama_mtp_prepare_sinfo_for_warmup(llama_context * ctx) {
+    return ctx->mtp_prepare_sinfo_for_warmup();
 }
 
-void llama_mtp_prepare_sinfo_for_update(llama_context * ctx, int32_t n_accepted) {
-    ctx->mtp_prepare_sinfo_for_update(n_accepted);
+bool llama_mtp_prepare_sinfo_for_update(llama_context * ctx, int32_t n_accepted) {
+    return ctx->mtp_prepare_sinfo_for_update(n_accepted);
 }
 
 void llama_mtp_cancel_sinfo_update(llama_context * ctx) {

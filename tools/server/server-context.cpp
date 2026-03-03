@@ -2036,6 +2036,7 @@ private:
 
         // track if given slot can be batched with slots already in the batch
         server_slot * slot_batched = nullptr;
+        bool batch_need_embd = false;
 
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
@@ -2054,6 +2055,7 @@ private:
             } else if (!slot_batched->can_batch_with(slot)) {
                 continue;
             }
+            batch_need_embd = batch_need_embd || slot.need_embd();
 
             // generate draft tokens in speculative decoding mode
             // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
@@ -2589,6 +2591,7 @@ private:
                 if (!slot_batched) {
                     slot_batched = &slot;
                 }
+                batch_need_embd = batch_need_embd || slot.need_embd();
 
                 if (batch.n_tokens >= n_batch) {
                     break;
@@ -2609,7 +2612,7 @@ private:
                 slot_batched->lora[alora_disabled_id].scale = alora_scale;
             }
 
-            llama_set_embeddings(ctx, slot_batched->need_embd());
+            llama_set_embeddings(ctx, batch_need_embd);
         }
 
         if (batch.n_tokens == 0) {
@@ -2690,6 +2693,26 @@ private:
 
             // on successful decode, restore the original batch size
             n_batch = llama_n_batch(ctx);
+
+            bool do_mtp_warmup = false;
+            for (auto & slot : slots) {
+                if (slot.i_batch < (int) i || slot.i_batch >= (int) (i + n_tokens)) {
+                    continue;
+                }
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
+                    if (slot.spec && slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
+                        do_mtp_warmup = true;
+                        break;
+                    }
+                }
+            }
+
+            if (do_mtp_warmup) {
+                if (llama_mtp_prepare_sinfo_for_warmup(ctx)) {
+                    mtp_update_kv_cache(ctx, batch_view, true);
+                    llama_mtp_cancel_sinfo_update(ctx);
+                }
+            }
 
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
             for (auto & slot : slots) {

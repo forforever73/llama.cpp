@@ -135,7 +135,7 @@ int main(int argc, char ** argv) {
 
     struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
 
-    common_speculative_begin(spec, prompt_tgt);
+    common_speculative_begin(spec, prompt_tgt, nullptr, 0);
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
