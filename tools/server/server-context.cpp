@@ -225,7 +225,8 @@ struct server_slot {
 
         return
             !need_embd() ||
-            (llama_get_memory(ctx) && llama_pooling_type(ctx) == LLAMA_POOLING_TYPE_LAST);
+            (llama_get_memory(ctx) && llama_pooling_type(ctx) == LLAMA_POOLING_TYPE_LAST) ||
+            (llama_get_memory(ctx) && llama_pooling_type(ctx) == LLAMA_POOLING_TYPE_NONE);
     }
 
     bool can_batch_with(server_slot & other_slot) const {
