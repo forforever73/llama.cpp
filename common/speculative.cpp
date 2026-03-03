@@ -927,9 +927,29 @@ struct common_speculative_state_mtp : public common_speculative_state {
             return;
         }
 
+        // Snapshot embeddings for all accepted tokens before any MTP update
+        // overwrites the context output buffers.
+        std::vector<float> accepted_hidden;
+        accepted_hidden.resize((size_t) n_accepted_clamped * n_embd);
+        bool has_accept_hidden = true;
+        for (int32_t i = 0; i < n_accepted_clamped; ++i) {
+            const int32_t embd_idx = i + 1; // accepted tokens start from index 1 in the main decode batch
+            float * embd = llama_get_embeddings_ith(ctx, embd_idx);
+            if (!embd) {
+                has_accept_hidden = false;
+                break;
+            }
+            memcpy(accepted_hidden.data() + (size_t) i * n_embd, embd, n_embd * sizeof(float));
+        }
+
+        if (!has_accept_hidden) {
+            return;
+        }
+
         for (int32_t k = 0; k < n_nextn; ++k) {
             std::vector<llama_token> tokens;
             std::vector<llama_pos> positions;
+            std::vector<int32_t> accept_idxs;
 
             for (int32_t i = 0; i < n_accepted_clamped; ++i) {
                 if ((i % n_nextn) != k) {
@@ -937,6 +957,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 }
                 tokens.push_back(saved_draft_tokens[i]);
                 positions.push_back(saved_prompt_size + 1 + i);
+                accept_idxs.push_back(i);
             }
 
             if (tokens.empty()) {
@@ -947,13 +968,10 @@ struct common_speculative_state_mtp : public common_speculative_state {
             hidden_buf.resize(tokens.size() * n_embd);
 
             for (size_t i = 0; i < tokens.size(); ++i) {
-                const int32_t embd_idx = (int32_t) (positions[i] - saved_prompt_size);
-                float * embd = llama_get_embeddings_ith(ctx, embd_idx);
-                if (!embd) {
-                    hidden_buf.clear();
-                    break;
-                }
-                memcpy(hidden_buf.data() + i * n_embd, embd, n_embd * sizeof(float));
+                const int32_t src_idx = accept_idxs[i];
+                memcpy(hidden_buf.data() + i * n_embd,
+                       accepted_hidden.data() + (size_t) src_idx * n_embd,
+                       n_embd * sizeof(float));
             }
 
             if (hidden_buf.empty()) {
