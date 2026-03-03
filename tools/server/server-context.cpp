@@ -2809,6 +2809,7 @@ private:
 
                 // the accepted tokens from the speculation
                 const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+                const std::vector<int32_t> batch_idxs = slot.i_batch_dft;
                 slot.i_batch_dft.clear();
                 slot.drafted.clear();
 
@@ -2822,7 +2823,7 @@ private:
                 slot.n_draft_accepted += ids.size() - 1;
 
                 // inform the speculative decoding about the number of accepted tokens
-                common_speculative_accept(slot.spec, ids.size() - 1);
+                common_speculative_accept(slot.spec, ids.size() - 1, batch_idxs);
 
                 // rollback to the state before sampling the draft tokens
                 slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);

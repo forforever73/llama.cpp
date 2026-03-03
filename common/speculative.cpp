@@ -143,7 +143,7 @@ struct common_speculative_state {
             llama_token id_last,
             llama_tokens & result) = 0;
 
-    virtual void accept(uint16_t n_accepted) = 0;
+    virtual void accept(uint16_t n_accepted, const std::vector<int32_t> & batch_idxs) = 0;
 };
 
 struct common_speculative_state_draft : public common_speculative_state {
@@ -405,8 +405,9 @@ struct common_speculative_state_draft : public common_speculative_state {
         }
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, const std::vector<int32_t> & batch_idxs) override {
         // noop
+        GGML_UNUSED(batch_idxs);
         GGML_UNUSED(n_accepted);
     }
 
@@ -458,8 +459,9 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
         GGML_UNUSED(draft_tokens);
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, const std::vector<int32_t> & batch_idxs) override {
         // noop
+        GGML_UNUSED(batch_idxs);
         GGML_UNUSED(n_accepted);
     }
 };
@@ -487,8 +489,9 @@ struct common_speculative_state_ngram_simple : public common_speculative_state {
         GGML_UNUSED(params);
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, const std::vector<int32_t> & batch_idxs) override {
         // noop
+        GGML_UNUSED(batch_idxs);
         GGML_UNUSED(n_accepted);
     }
 };
@@ -515,7 +518,8 @@ struct common_speculative_state_ngram_map_k : public common_speculative_state {
         GGML_UNUSED(params);
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, const std::vector<int32_t> & batch_idxs) override {
+        GGML_UNUSED(batch_idxs);
         common_ngram_map_accept(map, n_accepted);
     }
 };
@@ -623,7 +627,8 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
         n_draft_last = result.size();
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, const std::vector<int32_t> & batch_idxs) override {
+        GGML_UNUSED(batch_idxs);
         if (verbose) {
             LOG_INF("%s: accepted %d tokens from %zu drafted tokens\n", __func__, n_accepted, n_draft_last);
         }
@@ -733,8 +738,9 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
         }
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, const std::vector<int32_t> & batch_idxs) override {
         // TODO: noop
+        GGML_UNUSED(batch_idxs);
         GGML_UNUSED(n_accepted);
     }
 };
@@ -903,18 +909,32 @@ struct common_speculative_state_mtp : public common_speculative_state {
         llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_NONE);
     }
 
-    void accept(uint16_t n_accepted) override {
+    void accept(uint16_t n_accepted, const std::vector<int32_t> & batch_idxs) override {
         if (n_accepted == 0) {
             has_saved_hidden = false;
             return;
         }
+
+        const bool has_batch_idxs = !batch_idxs.empty();
+        auto get_batch_idx = [&](int32_t idx) -> int32_t {
+            return has_batch_idxs ? batch_idxs[idx] : idx;
+        };
 
         // Save hidden state for the next draft() call.
         // In single-slot mode, batch index n_accepted corresponds to the position
         // where the re-sampled token was produced (context up to the last accepted
         // token). We save it now because subsequent operations may invalidate the
         // context's embedding buffer.
-        float * next_hidden = llama_get_embeddings_ith(ctx, (int) n_accepted);
+        int32_t next_hidden_idx = (int32_t) n_accepted;
+        if (has_batch_idxs) {
+            if ((size_t) n_accepted >= batch_idxs.size()) {
+                has_saved_hidden = false;
+                return;
+            }
+            next_hidden_idx = batch_idxs[n_accepted];
+        }
+
+        float * next_hidden = llama_get_embeddings_ith(ctx, next_hidden_idx);
         if (next_hidden) {
             memcpy(saved_prev_hidden.data(), next_hidden, n_embd * sizeof(float));
             has_saved_hidden = true;
@@ -933,7 +953,11 @@ struct common_speculative_state_mtp : public common_speculative_state {
         accepted_hidden.resize((size_t) n_accepted_clamped * n_embd);
         bool has_accept_hidden = true;
         for (int32_t i = 0; i < n_accepted_clamped; ++i) {
-            const int32_t embd_idx = i + 1; // accepted tokens start from index 1 in the main decode batch
+            if (has_batch_idxs && (size_t) (i + 1) >= batch_idxs.size()) {
+                has_accept_hidden = false;
+                break;
+            }
+            const int32_t embd_idx = get_batch_idx(i + 1); // accepted tokens start after the sampled token
             float * embd = llama_get_embeddings_ith(ctx, embd_idx);
             if (!embd) {
                 has_accept_hidden = false;
@@ -1301,7 +1325,7 @@ llama_tokens common_speculative_draft(
     return result;
 }
 
-void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
+void common_speculative_accept(common_speculative * spec, uint16_t n_accepted, const std::vector<int32_t> & batch_idxs) {
     if (n_accepted == 0) {
         return;
     }
@@ -1317,7 +1341,7 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
             impl->n_acc_tokens += n_accepted;
         }
 
-        impl->accept(n_accepted);
+        impl->accept(n_accepted, batch_idxs);
         impl->n_call_accept++;
     }
 }
