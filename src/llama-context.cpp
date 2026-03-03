@@ -9,6 +9,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -19,12 +20,19 @@
 // llama_context
 //
 
+struct llama_context_kv_cache_data {
+    llama_kv_cache::slot_info_vec_t last_main_model_sinfos;
+    llama_kv_cache::slot_info_vec_t resized_sinfo_for_force;
+    const llama_kv_cache::slot_info_vec_t * forced_sinfos = nullptr;
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
+    kv_cache_data(std::make_unique<llama_context_kv_cache_data>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
@@ -993,24 +1001,35 @@ void llama_context::set_mtp_hidden_state(const float * data, int32_t n_tokens) {
 }
 
 void llama_context::mtp_prepare_sinfo_for_warmup() {
-    if (!has_last_main_sinfos) {
-        LLAMA_LOG_WARN("%s: no saved main sinfos, MTP warmup will use normal slot allocation\n", __func__);
+    const auto & last_sinfo = kv_cache_data->last_main_model_sinfos;
+    if (last_sinfo.empty()) {
+        LLAMA_LOG_ERROR("%s: The main call sinfo is not available for warmup.\n", __func__);
         return;
     }
-    has_forced_sinfos = true;
+
+    kv_cache_data->forced_sinfos = &last_sinfo;
 }
 
 void llama_context::mtp_prepare_sinfo_for_update(int32_t n_accepted) {
-    GGML_UNUSED(n_accepted);
-    if (!has_last_main_sinfos) {
-        LLAMA_LOG_WARN("%s: no saved main sinfos, MTP update will use normal slot allocation\n", __func__);
+    const auto & last_sinfo = kv_cache_data->last_main_model_sinfos;
+    if (last_sinfo.empty() || last_sinfo[0].idxs.empty()) {
+        LLAMA_LOG_ERROR("%s: The sinfo for the last main call is not available.\n", __func__);
         return;
     }
-    has_forced_sinfos = true;
+
+    kv_cache_data->resized_sinfo_for_force = last_sinfo;
+
+    auto & idxs = kv_cache_data->resized_sinfo_for_force[0].idxs[0];
+    if (n_accepted > (int32_t) idxs.size()) {
+        LLAMA_LOG_WARN("%s: n_accepted (%d) exceeds sinfo size (%zu), clamping\n", __func__, n_accepted, idxs.size());
+    }
+    idxs.resize(std::min(idxs.size(), (size_t) n_accepted));
+
+    kv_cache_data->forced_sinfos = &kv_cache_data->resized_sinfo_for_force;
 }
 
 void llama_context::mtp_cancel_sinfo_update() {
-    has_forced_sinfos = false;
+    kv_cache_data->forced_sinfos = nullptr;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -1545,8 +1564,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    const auto * forced_sinfos = kv_cache_data->forced_sinfos;
+    const bool use_forced_sinfos = forced_sinfos && !forced_sinfos->empty();
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        if (use_forced_sinfos) {
+            if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+                mctx = iswa->init_batch_with_sinfos(*balloc, cparams.n_ubatch, *forced_sinfos, true);
+            } else if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+                mctx = kv->init_batch_with_sinfos(*balloc, cparams.n_ubatch, *forced_sinfos, true);
+            } else {
+                mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+            }
+        } else {
+            mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        }
+
         if (!mctx) {
             return -2;
         }
@@ -1589,7 +1622,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // MTP warmup/accept: set is_inplace to skip cell metadata updates
-    if (has_forced_sinfos &&
+    if (use_forced_sinfos &&
             (mtp_op_type == LLAMA_MTP_OP_WARMUP || mtp_op_type == LLAMA_MTP_OP_UPDATE_ACCEPTED)) {
         auto * iswa_ctx = dynamic_cast<llama_kv_cache_iswa_context *>(mctx.get());
         if (iswa_ctx) {
@@ -1761,7 +1794,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // save sinfos from main model decode for MTP KV alignment
     if (mtp_op_type == LLAMA_MTP_OP_NONE && model.hparams.nextn_predict_layers > 0) {
-        has_last_main_sinfos = true;
+        if (auto * iswa_ctx = dynamic_cast<llama_kv_cache_iswa_context *>(mctx.get())) {
+            kv_cache_data->last_main_model_sinfos = iswa_ctx->get_base()->get_sinfos();
+        } else if (auto * kv_ctx = dynamic_cast<llama_kv_cache_context *>(mctx.get())) {
+            kv_cache_data->last_main_model_sinfos = kv_ctx->get_sinfos();
+        } else {
+            kv_cache_data->last_main_model_sinfos.clear();
+        }
     }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith

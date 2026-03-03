@@ -119,6 +119,12 @@ public:
             uint32_t n_ubatch,
             bool embd_all) override;
 
+    llama_memory_context_ptr init_batch_with_sinfos(
+            llama_batch_allocr & balloc,
+            uint32_t n_ubatch,
+            const slot_info_vec_t & sinfos,
+            bool is_inplace_update);
+
     llama_memory_context_ptr init_full() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
@@ -309,6 +315,11 @@ public:
             llama_kv_cache * kv,
             slot_info_vec_t sinfos,
             std::vector<llama_ubatch> ubatches);
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            slot_info_vec_t sinfos,
+            std::vector<llama_ubatch> ubatches,
+            bool is_inplace_update);
 
     virtual ~llama_kv_cache_context();
 

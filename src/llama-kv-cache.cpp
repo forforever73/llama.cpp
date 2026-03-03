@@ -547,6 +547,34 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
     return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
 
+llama_memory_context_ptr llama_kv_cache::init_batch_with_sinfos(
+        llama_batch_allocr & balloc,
+        uint32_t n_ubatch,
+        const slot_info_vec_t & sinfos,
+        bool is_inplace_update) {
+    if (sinfos.empty()) {
+        return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
+    balloc.split_reset();
+
+    std::vector<llama_ubatch> ubatches;
+    while (true) {
+        auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true);
+        if (ubatch.n_tokens == 0) {
+            break;
+        }
+        ubatches.push_back(std::move(ubatch)); // NOLINT
+    }
+
+    if (ubatches.size() != sinfos.size()) {
+        return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
+    return std::make_unique<llama_kv_cache_context>(
+            this, sinfos, std::move(ubatches), is_inplace_update);
+}
+
 llama_memory_context_ptr llama_kv_cache::init_full() {
     return std::make_unique<llama_kv_cache_context>(this);
 }
@@ -2183,6 +2211,13 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
+        llama_kv_cache::slot_info_vec_t sinfos,
+        std::vector<llama_ubatch> ubatches,
+        bool is_inplace_update) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)), is_inplace(is_inplace_update) {
 }
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;

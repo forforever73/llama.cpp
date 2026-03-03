@@ -14,6 +14,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+struct llama_context_kv_cache_data;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -272,6 +273,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::unique_ptr<llama_memory_i> memory;
+    std::unique_ptr<llama_context_kv_cache_data> kv_cache_data;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -348,10 +350,6 @@ private:
     int32_t                 mtp_layer_idx     = -1;
     std::vector<float>      mtp_hidden_state;
     int32_t                 mtp_hidden_n_tokens = 0;
-
-    // KV cache alignment: saved sinfos from last main model decode
-    bool has_last_main_sinfos = false;
-    bool has_forced_sinfos    = false;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

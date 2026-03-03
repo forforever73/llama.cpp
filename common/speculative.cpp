@@ -25,7 +25,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE
+    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,
+    COMMON_SPECULATIVE_TYPE_MTP
 };
 
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
@@ -36,7 +37,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"mtp",           COMMON_SPECULATIVE_TYPE_MTP}
 };
 
 struct common_speculative_config {
@@ -737,6 +739,247 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
     }
 };
 
+struct common_speculative_state_mtp : public common_speculative_state {
+    llama_context * ctx;
+    int32_t n_nextn;
+    int32_t n_layer_main;
+    int32_t n_embd;
+
+    common_sampler * smpl;
+
+    llama_token    saved_id_last = 0;
+    llama_tokens   saved_draft_tokens;
+    llama_pos      saved_prompt_size = 0;
+
+    std::vector<float> saved_prev_hidden;
+    bool               has_saved_hidden = false;
+
+    common_speculative_state_mtp(
+            enum common_speculative_type type,
+            llama_context * ctx,
+            int32_t n_nextn)
+        : common_speculative_state(type)
+        , ctx(ctx)
+        , n_nextn(n_nextn)
+        , n_layer_main(llama_model_n_layer(llama_get_model(ctx)) - n_nextn)
+        , n_embd(llama_model_n_embd(llama_get_model(ctx)))
+    {
+        common_params_sampling sparams;
+        sparams.no_perf = false;
+        sparams.top_k = 10;
+        sparams.samplers = {
+            COMMON_SAMPLER_TYPE_TOP_K,
+        };
+
+        smpl = common_sampler_init(llama_get_model(ctx), sparams);
+        saved_prev_hidden.resize(n_embd);
+
+        llama_set_embeddings(ctx, true);
+    }
+
+    ~common_speculative_state_mtp() override {
+        common_sampler_free(smpl);
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        has_saved_hidden = false;
+
+        if (prompt.empty()) {
+            return;
+        }
+
+        float * embd = llama_get_embeddings(ctx);
+        if (!embd) {
+            return;
+        }
+
+        const int32_t n_prompt = (int32_t) prompt.size();
+
+        llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+        for (int32_t i = 0; i < n_prompt; ++i) {
+            common_batch_add(batch, prompt[i], i, {0}, true);
+        }
+
+        for (int32_t k = 0; k < n_nextn; ++k) {
+            llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_WARMUP);
+            llama_set_mtp_layer_idx(ctx, n_layer_main + k);
+            llama_set_mtp_hidden_state(ctx, embd, n_prompt);
+            llama_mtp_prepare_sinfo_for_warmup(ctx);
+
+            const int ret = llama_decode(ctx, batch);
+
+            llama_mtp_cancel_sinfo_update(ctx);
+            if (ret != 0) {
+                break;
+            }
+        }
+
+        llama_batch_free(batch);
+        llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_NONE);
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        result.clear();
+        result.reserve(params.n_max);
+
+        saved_id_last = id_last;
+        saved_prompt_size = (llama_pos) prompt_tgt.size();
+        saved_draft_tokens.clear();
+
+        std::vector<float> hidden_buf(n_embd);
+
+        if (has_saved_hidden) {
+            memcpy(hidden_buf.data(), saved_prev_hidden.data(), n_embd * sizeof(float));
+            has_saved_hidden = false;
+        } else {
+            float * emb = llama_get_embeddings_ith(ctx, -1);
+            if (!emb) {
+                return;
+            }
+            memcpy(hidden_buf.data(), emb, n_embd * sizeof(float));
+        }
+
+        common_sampler_reset(smpl);
+
+        for (int step = 0; step < params.n_max; step++) {
+            int mtp_layer_idx_cur = n_layer_main + (step % n_nextn);
+
+            llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_DRAFT_GEN);
+            llama_set_mtp_layer_idx(ctx, mtp_layer_idx_cur);
+            llama_set_mtp_hidden_state(ctx, hidden_buf.data(), 1);
+
+            llama_token input_token = (step == 0) ? id_last : result.back();
+            llama_pos pos = saved_prompt_size + step;
+
+            llama_batch batch = llama_batch_init(1, 0, 1);
+            common_batch_add(batch, input_token, pos, {0}, true);
+
+            int ret = llama_decode(ctx, batch);
+            llama_batch_free(batch);
+
+            if (ret != 0) {
+                break;
+            }
+
+            common_sampler_sample(smpl, ctx, 0, true);
+            const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+            if (!cur_p || cur_p->size == 0) {
+                break;
+            }
+
+            const llama_token id = cur_p->data[0].id;
+            const float       p  = cur_p->data[0].p;
+
+            common_sampler_accept(smpl, id, true);
+
+            result.push_back(id);
+            saved_draft_tokens.push_back(id);
+
+            if ((int) result.size() >= params.n_max) {
+                break;
+            }
+
+            if (p < params.p_min) {
+                break;
+            }
+
+            float * new_hidden = llama_get_embeddings_ith(ctx, -1);
+            if (!new_hidden) {
+                break;
+            }
+            memcpy(hidden_buf.data(), new_hidden, n_embd * sizeof(float));
+        }
+
+        auto * mem = llama_get_memory(ctx);
+        if (mem) {
+            llama_memory_seq_rm(mem, 0, saved_prompt_size, -1);
+        }
+
+        llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_NONE);
+    }
+
+    void accept(uint16_t n_accepted) override {
+        if (n_accepted == 0) {
+            has_saved_hidden = false;
+            return;
+        }
+
+        // Save hidden state for the next draft() call.
+        // In single-slot mode, batch index n_accepted corresponds to the position
+        // where the re-sampled token was produced (context up to the last accepted
+        // token). We save it now because subsequent operations may invalidate the
+        // context's embedding buffer.
+        float * next_hidden = llama_get_embeddings_ith(ctx, (int) n_accepted);
+        if (next_hidden) {
+            memcpy(saved_prev_hidden.data(), next_hidden, n_embd * sizeof(float));
+            has_saved_hidden = true;
+        } else {
+            has_saved_hidden = false;
+        }
+
+        const int32_t n_accepted_clamped = std::min<int32_t>(n_accepted, (int32_t) saved_draft_tokens.size());
+        if (n_accepted_clamped <= 0) {
+            return;
+        }
+
+        for (int32_t k = 0; k < n_nextn; ++k) {
+            std::vector<llama_token> tokens;
+            std::vector<llama_pos> positions;
+
+            for (int32_t i = 0; i < n_accepted_clamped; ++i) {
+                if ((i % n_nextn) != k) {
+                    continue;
+                }
+                tokens.push_back(saved_draft_tokens[i]);
+                positions.push_back(saved_prompt_size + 1 + i);
+            }
+
+            if (tokens.empty()) {
+                continue;
+            }
+
+            std::vector<float> hidden_buf;
+            hidden_buf.resize(tokens.size() * n_embd);
+
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                const int32_t embd_idx = (int32_t) (positions[i] - saved_prompt_size);
+                float * embd = llama_get_embeddings_ith(ctx, embd_idx);
+                if (!embd) {
+                    hidden_buf.clear();
+                    break;
+                }
+                memcpy(hidden_buf.data() + i * n_embd, embd, n_embd * sizeof(float));
+            }
+
+            if (hidden_buf.empty()) {
+                continue;
+            }
+
+            llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                common_batch_add(batch, tokens[i], positions[i], {0}, true);
+            }
+
+            llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_UPDATE_ACCEPTED);
+            llama_set_mtp_layer_idx(ctx, n_layer_main + k);
+            llama_set_mtp_hidden_state(ctx, hidden_buf.data(), (int32_t) tokens.size());
+            llama_mtp_prepare_sinfo_for_update(ctx, (int32_t) tokens.size());
+
+            llama_decode(ctx, batch);
+
+            llama_mtp_cancel_sinfo_update(ctx);
+            llama_batch_free(batch);
+        }
+
+        llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_NONE);
+    }
+};
+
 struct common_speculative {
     std::vector<std::unique_ptr<common_speculative_state>> impls; // list of implementations to use and their states
     common_speculative_state * curr_impl = nullptr; // current implementation in use (for stats)
@@ -786,6 +1029,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
+        case COMMON_SPECULATIVE_TYPE_MTP:           return "mtp";
         default:                                    return "unknown";
     }
 }
@@ -859,6 +1103,7 @@ common_speculative * common_speculative_init(
         bool has_ngram_map_k   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
         bool has_ngram_map_k4v = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         bool has_ngram_mod     = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+        bool has_mtp           = (params.type == COMMON_SPECULATIVE_TYPE_MTP);
 
         // In a more complex implementation we could use the same implementation but with different parameters.
         // This was initially used in PR-18471 but removed to simplify the code.
@@ -891,6 +1136,9 @@ common_speculative * common_speculative_init(
         }
         if (has_ngram_cache) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
+        }
+        if (has_mtp) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_MTP, params));
         }
         if (has_draft) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
@@ -953,6 +1201,17 @@ common_speculative * common_speculative_init(
                 auto state = create_state_ngram_cache(
                         params.lookup_cache_static, params.lookup_cache_dynamic, config);
                 impls.push_back(std::make_unique<common_speculative_state_ngram_cache>(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_MTP: {
+                const auto * model_tgt = llama_get_model(ctx_tgt);
+                const int32_t n_nextn = llama_model_n_nextn_predict_layers(model_tgt);
+                if (n_nextn > 0) {
+                    impls.push_back(std::make_unique<common_speculative_state_mtp>(
+                        config.type, ctx_tgt, n_nextn));
+                } else {
+                    LOG_WRN("MTP speculative requested but model has no nextn_predict_layers\n");
+                }
                 break;
             }
             default:
