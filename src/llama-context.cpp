@@ -1525,6 +1525,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    const auto * forced_sinfos = kv_cache_data->forced_sinfos;
+    const bool use_forced_sinfos = forced_sinfos && !forced_sinfos->empty();
     const bool is_mtp_inplace = use_forced_sinfos &&
         (mtp_op_type == LLAMA_MTP_OP_WARMUP || mtp_op_type == LLAMA_MTP_OP_UPDATE_ACCEPTED);
     const llama_memory_i * memory_for_batch = is_mtp_inplace ? nullptr : memory.get();
@@ -1567,9 +1569,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
     memory_update(false);
 
     llama_memory_context_ptr mctx;
-
-    const auto * forced_sinfos = kv_cache_data->forced_sinfos;
-    const bool use_forced_sinfos = forced_sinfos && !forced_sinfos->empty();
 
     while (true) {
         if (use_forced_sinfos) {
