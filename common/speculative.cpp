@@ -745,58 +745,10 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
     }
 };
 
-void mtp_update_kv_cache(llama_context * ctx, const llama_batch & batch, bool is_warmup) {
-    if (batch.n_tokens == 0) {
-        return;
-    }
-
-    if (!ctx) {
-        LOG_ERR("%s: ctx is null\n", __func__);
-        return;
-    }
-
-    const auto * model = llama_get_model(ctx);
-    if (!model) {
-        LOG_ERR("%s: model is null\n", __func__);
-        return;
-    }
-
-    const int32_t n_nextn = llama_model_n_nextn_predict_layers(model);
-    if (n_nextn <= 0) {
-        LOG_WRN("%s: model has no nextn_predict_layers\n", __func__);
-        return;
-    }
-
-    if (!llama_get_embeddings(ctx)) {
-        LOG_WRN("%s: embeddings not available for MTP update\n", __func__);
-        return;
-    }
-
-    const int32_t n_layer_main = llama_model_n_layer(model) - n_nextn;
-    const auto op_type = is_warmup ? LLAMA_MTP_OP_WARMUP : LLAMA_MTP_OP_UPDATE_ACCEPTED;
-
-    LOG_DBG("[MTP-UPDATE|%s] Updating %d tokens...\n", is_warmup ? "PROMPT_WARMUP" : "GEN_ACCEPTED", batch.n_tokens);
-
-    llama_batch mtp_batch = batch;
-    if (mtp_batch.logits) {
-        for (int32_t i = 0; i < mtp_batch.n_tokens; ++i) {
-            mtp_batch.logits[i] = true;
-        }
-    }
-
-    llama_set_mtp_op_type(ctx, op_type);
-
-    for (int32_t k = 0; k < n_nextn; ++k) {
-        llama_set_mtp_layer_idx(ctx, n_layer_main + k);
-
-        const int ret = llama_decode(ctx, mtp_batch);
-        if (ret != 0) {
-            LOG_WRN("%s: llama_decode failed (ret = %d)\n", __func__, ret);
-            break;
-        }
-    }
-
-    llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_NONE);
+llama_seq_id mtp_seq_id(llama_seq_id seq_id_base, llama_seq_id slot_id, int32_t n_nextn, int32_t layer_residue) {
+    GGML_ASSERT(n_nextn > 0);
+    GGML_ASSERT(layer_residue >= 0 && layer_residue < n_nextn);
+    return seq_id_base + slot_id * n_nextn + layer_residue;
 }
 
 struct common_speculative_state_mtp : public common_speculative_state {
@@ -804,6 +756,8 @@ struct common_speculative_state_mtp : public common_speculative_state {
     int32_t n_nextn;
     int32_t n_layer_main;
     int32_t n_embd;
+    llama_seq_id slot_id = 0;
+    llama_seq_id seq_id_base = 0;
 
     common_sampler * smpl;
 
@@ -813,16 +767,21 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
     std::vector<float> saved_prev_hidden;
     bool               has_saved_hidden = false;
+    std::vector<bool>  warmup_done;
 
     common_speculative_state_mtp(
             enum common_speculative_type type,
             llama_context * ctx,
-            int32_t n_nextn)
+            int32_t n_nextn,
+            llama_seq_id slot_id,
+            llama_seq_id seq_id_base)
         : common_speculative_state(type)
         , ctx(ctx)
         , n_nextn(n_nextn)
         , n_layer_main(llama_model_n_layer(llama_get_model(ctx)) - n_nextn)
         , n_embd(llama_model_n_embd(llama_get_model(ctx)))
+        , slot_id(slot_id)
+        , seq_id_base(seq_id_base)
     {
         common_params_sampling sparams;
         sparams.no_perf = false;
@@ -844,6 +803,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
         has_saved_hidden = false;
+        warmup_done.assign(n_nextn, false);
     }
 
     void draft(
@@ -874,7 +834,35 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
         common_sampler_reset(smpl);
 
+        auto run_warmup_if_needed = [&](int32_t layer_residue, const llama_tokens & prompt_tgt_local) {
+            if (warmup_done.empty()) {
+                warmup_done.assign(n_nextn, false);
+            }
+            if (layer_residue < 0 || layer_residue >= n_nextn || warmup_done[layer_residue]) {
+                return;
+            }
+
+            const int32_t mtp_layer_idx = n_layer_main + layer_residue;
+            llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_WARMUP);
+            llama_set_mtp_layer_idx(ctx, mtp_layer_idx);
+
+            llama_batch batch = llama_batch_init((int32_t) prompt_tgt_local.size(), 0, 1);
+            for (size_t i = 0; i < prompt_tgt_local.size(); ++i) {
+                const llama_pos pos = (llama_pos) i;
+                const llama_seq_id seq_id = mtp_seq_id(seq_id_base, slot_id, n_nextn, layer_residue);
+                common_batch_add(batch, prompt_tgt_local[i], pos, { seq_id }, true);
+            }
+
+            LOG_DBG("[MTP-WARMUP] seq=%d layer=%d tokens=%d\n", (int) mtp_seq_id(seq_id_base, slot_id, n_nextn, layer_residue), mtp_layer_idx, batch.n_tokens);
+
+            (void) llama_decode(ctx, batch);
+            llama_batch_free(batch);
+
+            warmup_done[layer_residue] = true;
+        };
+
         for (int step = 0; step < params.n_max; step++) {
+            run_warmup_if_needed(step % n_nextn, prompt_tgt);
             int mtp_layer_idx_cur = n_layer_main + (step % n_nextn);
 
             llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_DRAFT_GEN);
@@ -883,9 +871,11 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
             llama_token input_token = (step == 0) ? id_last : result.back();
             llama_pos pos = saved_prompt_size + step;
+            const llama_seq_id seq_id = mtp_seq_id(seq_id_base, slot_id, n_nextn, step % n_nextn);
 
             llama_batch batch = llama_batch_init(1, 0, 1);
-            common_batch_add(batch, input_token, pos, {0}, true);
+            LOG_DBG("[MTP-DRAFT] step=%d layer=%d seq=%d pos=%d\n", step, mtp_layer_idx_cur, (int) seq_id, (int) pos);
+            common_batch_add(batch, input_token, pos, { seq_id }, true);
 
             int ret = llama_decode(ctx, batch);
             llama_batch_free(batch);
@@ -926,7 +916,9 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
         auto * mem = llama_get_memory(ctx);
         if (mem) {
-            llama_memory_seq_rm(mem, 0, saved_prompt_size, -1);
+            for (int32_t k = 0; k < n_nextn; ++k) {
+                llama_memory_seq_rm(mem, mtp_seq_id(seq_id_base, slot_id, n_nextn, k), saved_prompt_size, -1);
+            }
         }
 
         llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_NONE);
@@ -968,19 +960,27 @@ struct common_speculative_state_mtp : public common_speculative_state {
             return;
         }
 
-        llama_batch batch = llama_batch_init(n_accepted_clamped, 0, 1);
-        for (int32_t i = 0; i < n_accepted_clamped; ++i) {
-            common_batch_add(batch, saved_draft_tokens[i], saved_prompt_size + 1 + i, {0}, true);
-        }
+        for (int32_t k = 0; k < n_nextn; ++k) {
+            llama_batch batch = llama_batch_init(n_accepted_clamped, 0, 1);
+            int32_t n_local = 0;
+            for (int32_t i = k; i < n_accepted_clamped; i += n_nextn) {
+                const llama_pos pos = saved_prompt_size + 1 + i;
+                const llama_seq_id seq_id = mtp_seq_id(seq_id_base, slot_id, n_nextn, k);
+                common_batch_add(batch, saved_draft_tokens[i], pos, { seq_id }, true);
+                n_local++;
+            }
 
-        if (!llama_mtp_prepare_sinfo_for_update(ctx, n_accepted_clamped)) {
+            if (n_local > 0) {
+                batch.n_tokens = n_local;
+                llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_UPDATE_ACCEPTED);
+                llama_set_mtp_layer_idx(ctx, n_layer_main + k);
+                (void) llama_decode(ctx, batch);
+            }
+
             llama_batch_free(batch);
-            return;
         }
-        mtp_update_kv_cache(ctx, batch, false);
-        llama_mtp_cancel_sinfo_update(ctx);
 
-        llama_batch_free(batch);
+        llama_set_mtp_op_type(ctx, LLAMA_MTP_OP_NONE);
     }
 };
 
@@ -1086,7 +1086,9 @@ done:
 //
 common_speculative * common_speculative_init(
         common_params_speculative & params,
-        llama_context             * ctx_tgt) {
+        llama_context             * ctx_tgt,
+        llama_seq_id                slot_id,
+        llama_seq_id                seq_id_base) {
     llama_context * ctx_dft = nullptr;
     if (params.model_dft) {
         ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
@@ -1212,7 +1214,7 @@ common_speculative * common_speculative_init(
                 const int32_t n_nextn = llama_model_n_nextn_predict_layers(model_tgt);
                 if (n_nextn > 0) {
                     impls.push_back(std::make_unique<common_speculative_state_mtp>(
-                        config.type, ctx_tgt, n_nextn));
+                        config.type, ctx_tgt, n_nextn, slot_id, seq_id_base));
                 } else {
                     LOG_WRN("MTP speculative requested but model has no nextn_predict_layers\n");
                 }

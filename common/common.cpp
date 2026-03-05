@@ -1120,6 +1120,14 @@ common_init_result::common_init_result(common_params & params) :
     //    params.sampling.dry_penalty_last_n = llama_n_ctx(lctx);
     //}
 
+    if (params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
+        const int32_t n_nextn = llama_model_n_nextn_predict_layers(model);
+        if (n_nextn > 0) {
+            const uint32_t n_slots = (uint32_t) params.n_parallel;
+            cparams.n_seq_max = std::max<uint32_t>(cparams.n_seq_max, n_slots * (1u + (uint32_t) n_nextn));
+        }
+    }
+
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);

@@ -20,15 +20,16 @@ bool common_speculative_is_compat(llama_context * ctx_tgt);
 
 common_speculative * common_speculative_init(
         common_params_speculative & params,
-        llama_context             * ctx_tgt);
+        llama_context             * ctx_tgt,
+        llama_seq_id                slot_id = 0,
+        llama_seq_id                seq_id_base = 0);
 
 void common_speculative_free(common_speculative * spec);
 
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
 
-// update MTP KV cache for a batch using current context embeddings
-void mtp_update_kv_cache(llama_context * ctx, const llama_batch & batch, bool is_warmup);
+llama_seq_id mtp_seq_id(llama_seq_id seq_id_base, llama_seq_id slot_id, int32_t n_nextn, int32_t layer_residue);
 
 // sample up to n_draft tokens and add them to the batch using the draft model
 llama_tokens common_speculative_draft(

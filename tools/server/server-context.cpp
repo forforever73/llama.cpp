@@ -770,7 +770,7 @@ private:
 
             // try speculative decoding
             if (can_spec) {
-                slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
+                slot.spec = common_speculative_init(params_base.speculative, slot.ctx, slot.id, params_base.n_parallel);
                 if (slot.spec) {
                     if (mctx) {
                         SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
@@ -2694,26 +2694,6 @@ private:
 
             // on successful decode, restore the original batch size
             n_batch = llama_n_batch(ctx);
-
-            bool do_mtp_warmup = false;
-            for (auto & slot : slots) {
-                if (slot.i_batch < (int) i || slot.i_batch >= (int) (i + n_tokens)) {
-                    continue;
-                }
-                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
-                    if (slot.spec && slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
-                        do_mtp_warmup = true;
-                        break;
-                    }
-                }
-            }
-
-            if (do_mtp_warmup) {
-                if (llama_mtp_prepare_sinfo_for_warmup(ctx)) {
-                    mtp_update_kv_cache(ctx, batch_view, true);
-                    llama_mtp_cancel_sinfo_update(ctx);
-                }
-            }
 
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
             for (auto & slot : slots) {
