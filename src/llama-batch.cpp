@@ -296,19 +296,35 @@ bool llama_batch_allocr::init(
             const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
 
             if (p0 >= 0) {
+                const llama_pos p1 = seq_pos_min(s);
                 bool ok = true;
 
-                if (seq_pos_min(s) != p0 + 1) {
-                    ok = false;
+                if (allow_non_contiguous_pos) {
+                    if (batch.token) {
+                        ok = p0 < p1;
+                    } else {
+                        ok = p0 <= p1;
+                    }
+                } else {
+                    ok = (p1 == p0 + 1);
                 }
 
                 if (!ok) {
-                    LLAMA_LOG_ERROR(
-                            "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
-                            " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
-                            " - the tokens for sequence %d in the input batch have a starting position of Y = %d\n"
-                            " it is required that the sequence positions remain consecutive: Y = X + 1\n",
-                            __func__, s, s, p0, s, seq_pos_min(s));
+                    if (allow_non_contiguous_pos) {
+                        LLAMA_LOG_ERROR(
+                                "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
+                                " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
+                                " - the tokens for sequence %d in the input batch have a starting position of Y = %d\n"
+                                " for non-contiguous positions, it is required that the position satisfies: X < Y\n",
+                                __func__, s, s, p0, s, p1);
+                    } else {
+                        LLAMA_LOG_ERROR(
+                                "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
+                                " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
+                                " - the tokens for sequence %d in the input batch have a starting position of Y = %d\n"
+                                " it is required that the sequence positions remain consecutive: Y = X + 1\n",
+                                __func__, s, s, p0, s, p1);
+                    }
 
                     return false;
                 }
