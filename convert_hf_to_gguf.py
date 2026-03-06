@@ -8246,12 +8246,9 @@ class Step35Model(TextModel):
         kv_arr = [n_kv_swa if lt == "sliding_attention" else n_kv_base for lt in layer_types]
         swa_pat = [lt == "sliding_attention" for lt in layer_types]
 
-        n_main = self.hparams["num_hidden_layers"]
         nextn = self.hparams.get("num_nextn_predict_layers", 0)
         if nextn > 0:
             self.gguf_writer.add_nextn_predict_layers(nextn)
-            for i in range(n_main, n_main + nextn):
-                swa_pat[i] = False
 
         self.gguf_writer.add_head_count(head_arr)
         self.gguf_writer.add_head_count_kv(kv_arr)

@@ -789,7 +789,15 @@ void mtp_update_kv_cache(llama_context * ctx, const llama_batch & batch, bool is
     for (int32_t k = 0; k < n_nextn; ++k) {
         llama_set_mtp_layer_idx(ctx, n_layer_main + k);
 
+        const bool sinfo_ready = is_warmup
+            ? llama_mtp_prepare_sinfo_for_warmup(ctx)
+            : llama_mtp_prepare_sinfo_for_update(ctx, batch.n_tokens);
+        if (!sinfo_ready) {
+            break;
+        }
+
         const int ret = llama_decode(ctx, mtp_batch);
+        llama_mtp_cancel_sinfo_update(ctx);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode failed (ret = %d)\n", __func__, ret);
             break;
@@ -973,12 +981,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
             common_batch_add(batch, saved_draft_tokens[i], saved_prompt_size + 1 + i, {0}, true);
         }
 
-        if (!llama_mtp_prepare_sinfo_for_update(ctx, n_accepted_clamped)) {
-            llama_batch_free(batch);
-            return;
-        }
         mtp_update_kv_cache(ctx, batch, false);
-        llama_mtp_cancel_sinfo_update(ctx);
 
         llama_batch_free(batch);
     }

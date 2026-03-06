@@ -901,7 +901,6 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mtp_op_type      (params.mtp_op_type),
     mtp_layer_idx    (params.mtp_layer_idx),
     mtp_hidden_state (params.mtp_hidden_state),
-    mtp_rope_freq_base(params.mtp_rope_freq_base),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),

@@ -21,7 +21,8 @@
 //
 
 struct llama_context_kv_cache_data {
-    llama_kv_cache::slot_info_vec_t last_main_model_sinfos;
+    llama_kv_cache::slot_info_vec_t last_main_model_sinfos_base;
+    llama_kv_cache::slot_info_vec_t last_main_model_sinfos_swa;
     llama_kv_cache::slot_info_vec_t resized_sinfo_for_force;
     const llama_kv_cache::slot_info_vec_t * forced_sinfos = nullptr;
 };
@@ -996,7 +997,14 @@ void llama_context::set_draft_input_hidden_state(const float * hidden_state) {
 }
 
 bool llama_context::mtp_prepare_sinfo_for_warmup() {
-    const auto & last_sinfo = kv_cache_data->last_main_model_sinfos;
+    const auto & last_sinfo = [&]() -> const llama_kv_cache::slot_info_vec_t & {
+        if (dynamic_cast<llama_kv_cache_iswa *>(memory.get()) != nullptr &&
+                mtp_layer_idx >= 0 &&
+                model.hparams.is_swa(mtp_layer_idx)) {
+            return kv_cache_data->last_main_model_sinfos_swa;
+        }
+        return kv_cache_data->last_main_model_sinfos_base;
+    }();
     if (last_sinfo.empty()) {
         LLAMA_LOG_ERROR("%s: The main call sinfo is not available for warmup.\n", __func__);
         return false;
@@ -1007,7 +1015,14 @@ bool llama_context::mtp_prepare_sinfo_for_warmup() {
 }
 
 bool llama_context::mtp_prepare_sinfo_for_update(int32_t n_accepted) {
-    const auto & last_sinfo = kv_cache_data->last_main_model_sinfos;
+    const auto & last_sinfo = [&]() -> const llama_kv_cache::slot_info_vec_t & {
+        if (dynamic_cast<llama_kv_cache_iswa *>(memory.get()) != nullptr &&
+                mtp_layer_idx >= 0 &&
+                model.hparams.is_swa(mtp_layer_idx)) {
+            return kv_cache_data->last_main_model_sinfos_swa;
+        }
+        return kv_cache_data->last_main_model_sinfos_base;
+    }();
     if (last_sinfo.empty() || last_sinfo[0].idxs.empty()) {
         LLAMA_LOG_ERROR("%s: The sinfo for the last main call is not available.\n", __func__);
         return false;
@@ -1796,11 +1811,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // save sinfos from main model decode for MTP KV alignment
     if (mtp_op_type == LLAMA_MTP_OP_NONE && model.hparams.nextn_predict_layers > 0) {
         if (auto * iswa_ctx = dynamic_cast<llama_kv_cache_iswa_context *>(mctx.get())) {
-            kv_cache_data->last_main_model_sinfos = iswa_ctx->get_base()->get_sinfos();
+            kv_cache_data->last_main_model_sinfos_base = iswa_ctx->get_base()->get_sinfos();
+            kv_cache_data->last_main_model_sinfos_swa  = iswa_ctx->get_swa()->get_sinfos();
         } else if (auto * kv_ctx = dynamic_cast<llama_kv_cache_context *>(mctx.get())) {
-            kv_cache_data->last_main_model_sinfos = kv_ctx->get_sinfos();
+            kv_cache_data->last_main_model_sinfos_base = kv_ctx->get_sinfos();
+            kv_cache_data->last_main_model_sinfos_swa.clear();
         } else {
-            kv_cache_data->last_main_model_sinfos.clear();
+            kv_cache_data->last_main_model_sinfos_base.clear();
+            kv_cache_data->last_main_model_sinfos_swa.clear();
         }
     }
 
@@ -2158,7 +2176,6 @@ llm_graph_params llama_context::graph_params(
         /*.mtp_op_type        =*/ mtp_op,
         /*.mtp_layer_idx      =*/ mtp_layer_idx,
         /*.mtp_hidden_state   =*/ mtp_hidden,
-        /*.mtp_rope_freq_base =*/ model.hparams.rope_freq_base_train_swa,
         /*.samplers           =*/ sampling.samplers,
         /*.n_outputs          =*/ n_outputs,
         /*.cb                 =*/ graph_get_cb(),

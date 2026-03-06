@@ -5,8 +5,7 @@ ggml_tensor * llm_build_step35_iswa::build_layer(
                 int   il,
         ggml_tensor * inp_pos,
         llm_graph_input_attn_kv_iswa * inp_attn,
-        ggml_tensor * inp_out_ids,
-              float   rope_freq_base_override) {
+        ggml_tensor * inp_out_ids) {
 
     ggml_tensor * cur;
     ggml_tensor * inpSA = inpL;
@@ -14,9 +13,7 @@ ggml_tensor * llm_build_step35_iswa::build_layer(
     const uint32_t n_head_l    = hparams.n_head(il);
     const uint32_t n_head_kv_l = hparams.n_head_kv(il);
 
-    const float freq_base_l  = rope_freq_base_override > 0.0f
-        ? rope_freq_base_override
-        : model.get_rope_freq_base(cparams, il);
+    const float freq_base_l  = model.get_rope_freq_base(cparams, il);
     const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
 
     cur = inpL;
@@ -184,7 +181,7 @@ llm_build_step35_iswa::llm_build_step35_iswa(const llama_model & model, const ll
         cb(cur, "mtp_eh_proj", il);
 
         // 5. full decoder layer (attention + MoE FFN with KV cache R/W)
-        cur = build_layer(cur, il, inp_pos, inp_attn, nullptr, mtp_rope_freq_base);
+        cur = build_layer(cur, il, inp_pos, inp_attn, nullptr);
 
         // 6. save hidden state for next MTP step
         res->t_embd = cur;
@@ -217,7 +214,7 @@ llm_build_step35_iswa::llm_build_step35_iswa(const llama_model & model, const ll
 
     for (int il = 0; il < n_layer_main; ++il) {
         ggml_tensor * out_ids = (il == n_layer_main - 1) ? inp_out_ids : nullptr;
-        inpL = build_layer(inpL, il, inp_pos, inp_attn, out_ids, 0.0f);
+        inpL = build_layer(inpL, il, inp_pos, inp_attn, out_ids);
     }
 
     cur = inpL;

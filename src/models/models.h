@@ -670,8 +670,7 @@ private:
                     int   il,
             ggml_tensor * inp_pos,
             llm_graph_input_attn_kv_iswa * inp_attn,
-            ggml_tensor * inp_out_ids,
-                  float   rope_freq_base_override);
+            ggml_tensor * inp_out_ids);
 };
 
 struct llm_build_t5_dec : public llm_graph_context {

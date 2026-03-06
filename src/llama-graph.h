@@ -556,7 +556,6 @@ struct llm_graph_params {
     llm_mtp_op_type mtp_op_type = LLM_MTP_OP_NONE;
     int             mtp_layer_idx = -1;
     const float *   mtp_hidden_state = nullptr;
-    float           mtp_rope_freq_base = 0.0f;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -771,7 +770,6 @@ struct llm_graph_context {
     const llm_mtp_op_type mtp_op_type;
     const int             mtp_layer_idx;
     const float *         mtp_hidden_state;
-    const float           mtp_rope_freq_base;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

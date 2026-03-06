@@ -2709,10 +2709,7 @@ private:
             }
 
             if (do_mtp_warmup) {
-                if (llama_mtp_prepare_sinfo_for_warmup(ctx)) {
-                    mtp_update_kv_cache(ctx, batch_view, true);
-                    llama_mtp_cancel_sinfo_update(ctx);
-                }
+                mtp_update_kv_cache(ctx, batch_view, true);
             }
 
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
