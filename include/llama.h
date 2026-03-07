@@ -195,10 +195,8 @@ extern "C" {
     };
 
     enum llama_mtp_op_type {
-        LLAMA_MTP_OP_NONE            = 0,
-        LLAMA_MTP_OP_WARMUP          = 1,
-        LLAMA_MTP_OP_DRAFT_GEN       = 2,
-        LLAMA_MTP_OP_UPDATE_ACCEPTED = 3,
+        LLAMA_MTP_OP_NONE      = 0,
+        LLAMA_MTP_OP_DRAFT_GEN = 1,
     };
 
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
@@ -970,9 +968,6 @@ extern "C" {
     LLAMA_API void llama_set_mtp_op_type(struct llama_context * ctx, enum llama_mtp_op_type op);
     LLAMA_API void llama_set_mtp_layer_idx(struct llama_context * ctx, int32_t layer_idx);
     LLAMA_API void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state);
-    LLAMA_API bool llama_mtp_prepare_sinfo_for_warmup(struct llama_context * ctx);
-    LLAMA_API bool llama_mtp_prepare_sinfo_for_update(struct llama_context * ctx, int32_t n_accepted);
-    LLAMA_API void llama_mtp_cancel_sinfo_update(struct llama_context * ctx);
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);

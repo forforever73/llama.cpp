@@ -20,20 +20,12 @@
 // llama_context
 //
 
-struct llama_context_kv_cache_data {
-    llama_kv_cache::slot_info_vec_t last_main_model_sinfos_base;
-    llama_kv_cache::slot_info_vec_t last_main_model_sinfos_swa;
-    llama_kv_cache::slot_info_vec_t resized_sinfo_for_force;
-    const llama_kv_cache::slot_info_vec_t * forced_sinfos = nullptr;
-};
-
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
-    kv_cache_data(std::make_unique<llama_context_kv_cache_data>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
@@ -996,54 +988,6 @@ void llama_context::set_draft_input_hidden_state(const float * hidden_state) {
     draft_input_hidden_state = hidden_state;
 }
 
-bool llama_context::mtp_prepare_sinfo_for_warmup() {
-    const auto & last_sinfo = [&]() -> const llama_kv_cache::slot_info_vec_t & {
-        if (dynamic_cast<llama_kv_cache_iswa *>(memory.get()) != nullptr &&
-                mtp_layer_idx >= 0 &&
-                model.hparams.is_swa(mtp_layer_idx)) {
-            return kv_cache_data->last_main_model_sinfos_swa;
-        }
-        return kv_cache_data->last_main_model_sinfos_base;
-    }();
-    if (last_sinfo.empty()) {
-        LLAMA_LOG_ERROR("%s: The main call sinfo is not available for warmup.\n", __func__);
-        return false;
-    }
-
-    kv_cache_data->forced_sinfos = &last_sinfo;
-    return true;
-}
-
-bool llama_context::mtp_prepare_sinfo_for_update(int32_t n_accepted) {
-    const auto & last_sinfo = [&]() -> const llama_kv_cache::slot_info_vec_t & {
-        if (dynamic_cast<llama_kv_cache_iswa *>(memory.get()) != nullptr &&
-                mtp_layer_idx >= 0 &&
-                model.hparams.is_swa(mtp_layer_idx)) {
-            return kv_cache_data->last_main_model_sinfos_swa;
-        }
-        return kv_cache_data->last_main_model_sinfos_base;
-    }();
-    if (last_sinfo.empty() || last_sinfo[0].idxs.empty()) {
-        LLAMA_LOG_ERROR("%s: The sinfo for the last main call is not available.\n", __func__);
-        return false;
-    }
-
-    kv_cache_data->resized_sinfo_for_force = last_sinfo;
-
-    auto & idxs = kv_cache_data->resized_sinfo_for_force[0].idxs[0];
-    if (n_accepted > (int32_t) idxs.size()) {
-        LLAMA_LOG_WARN("%s: n_accepted (%d) exceeds sinfo size (%zu), clamping\n", __func__, n_accepted, idxs.size());
-    }
-    idxs.resize(std::min(idxs.size(), (size_t) n_accepted));
-
-    kv_cache_data->forced_sinfos = &kv_cache_data->resized_sinfo_for_force;
-    return true;
-}
-
-void llama_context::mtp_cancel_sinfo_update() {
-    kv_cache_data->forced_sinfos = nullptr;
-}
-
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1537,12 +1481,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    const auto * forced_sinfos = kv_cache_data->forced_sinfos;
-    const bool use_forced_sinfos = forced_sinfos && !forced_sinfos->empty();
-    const bool is_mtp_inplace = use_forced_sinfos &&
-        (mtp_op_type == LLAMA_MTP_OP_WARMUP || mtp_op_type == LLAMA_MTP_OP_UPDATE_ACCEPTED);
-    const llama_memory_i * memory_for_batch = is_mtp_inplace ? nullptr : memory.get();
-    const bool allow_non_contiguous_pos = is_mtp_inplace && mtp_op_type == LLAMA_MTP_OP_UPDATE_ACCEPTED;
+    const llama_memory_i * memory_for_batch = memory.get();
+    const bool allow_non_contiguous_pos = false;
 
     if (!balloc->init(batch_inp, vocab, memory_for_batch, n_embd, n_seq_max, output_all, allow_non_contiguous_pos)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
@@ -1584,17 +1524,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        if (use_forced_sinfos) {
-            if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
-                mctx = iswa->init_batch_with_sinfos(*balloc, cparams.n_ubatch, *forced_sinfos, true);
-            } else if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
-                mctx = kv->init_batch_with_sinfos(*balloc, cparams.n_ubatch, *forced_sinfos, true);
-            } else {
-                mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
-            }
-        } else {
-            mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
-        }
+        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
 
         if (!mctx) {
             return -2;
@@ -1635,15 +1565,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         break;
-    }
-
-    // MTP warmup/accept: set is_inplace to skip cell metadata updates
-    if (use_forced_sinfos &&
-            (mtp_op_type == LLAMA_MTP_OP_WARMUP || mtp_op_type == LLAMA_MTP_OP_UPDATE_ACCEPTED)) {
-        auto * iswa_ctx = dynamic_cast<llama_kv_cache_iswa_context *>(mctx.get());
-        if (iswa_ctx) {
-            iswa_ctx->set_inplace(true);
-        }
     }
 
     // reserve output buffer
@@ -1719,7 +1640,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             t_embd = res->get_embd_pooled();
         }
 
-        const bool mtp_skip_output = (mtp_op_type == LLAMA_MTP_OP_WARMUP || mtp_op_type == LLAMA_MTP_OP_UPDATE_ACCEPTED);
+        const bool mtp_skip_output = false;
 
         // extract logits
         if (!mtp_skip_output && logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
@@ -1807,20 +1728,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
     } while (mctx->next());
-
-    // save sinfos from main model decode for MTP KV alignment
-    if (mtp_op_type == LLAMA_MTP_OP_NONE && model.hparams.nextn_predict_layers > 0) {
-        if (auto * iswa_ctx = dynamic_cast<llama_kv_cache_iswa_context *>(mctx.get())) {
-            kv_cache_data->last_main_model_sinfos_base = iswa_ctx->get_base()->get_sinfos();
-            kv_cache_data->last_main_model_sinfos_swa  = iswa_ctx->get_swa()->get_sinfos();
-        } else if (auto * kv_ctx = dynamic_cast<llama_kv_cache_context *>(mctx.get())) {
-            kv_cache_data->last_main_model_sinfos_base = kv_ctx->get_sinfos();
-            kv_cache_data->last_main_model_sinfos_swa.clear();
-        } else {
-            kv_cache_data->last_main_model_sinfos_base.clear();
-            kv_cache_data->last_main_model_sinfos_swa.clear();
-        }
-    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2148,18 +2055,11 @@ llm_graph_params llama_context::graph_params(
                           llm_graph_type   gtype) const {
     llm_mtp_op_type mtp_op = LLM_MTP_OP_NONE;
     switch (mtp_op_type) {
-        case LLAMA_MTP_OP_NONE:            mtp_op = LLM_MTP_OP_NONE;            break;
-        case LLAMA_MTP_OP_WARMUP:          mtp_op = LLM_MTP_OP_WARMUP;          break;
-        case LLAMA_MTP_OP_DRAFT_GEN:       mtp_op = LLM_MTP_OP_DRAFT_GEN;       break;
-        case LLAMA_MTP_OP_UPDATE_ACCEPTED: mtp_op = LLM_MTP_OP_UPDATE_ACCEPTED; break;
+        case LLAMA_MTP_OP_NONE:      mtp_op = LLM_MTP_OP_NONE;      break;
+        case LLAMA_MTP_OP_DRAFT_GEN: mtp_op = LLM_MTP_OP_DRAFT_GEN; break;
     }
 
-    const float * mtp_hidden = nullptr;
-    if (mtp_op_type == LLAMA_MTP_OP_DRAFT_GEN) {
-        mtp_hidden = draft_input_hidden_state;
-    } else if (mtp_op_type == LLAMA_MTP_OP_WARMUP || mtp_op_type == LLAMA_MTP_OP_UPDATE_ACCEPTED) {
-        mtp_hidden = embd.data;
-    }
+    const float * mtp_hidden = mtp_op_type == LLAMA_MTP_OP_DRAFT_GEN ? draft_input_hidden_state : nullptr;
 
     return {
         /*.arch               =*/ model.arch,
@@ -3088,18 +2988,6 @@ void llama_set_mtp_layer_idx(llama_context * ctx, int32_t layer_idx) {
 
 void llama_set_draft_input_hidden_state(llama_context * ctx, const float * hidden_state) {
     ctx->set_draft_input_hidden_state(hidden_state);
-}
-
-bool llama_mtp_prepare_sinfo_for_warmup(llama_context * ctx) {
-    return ctx->mtp_prepare_sinfo_for_warmup();
-}
-
-bool llama_mtp_prepare_sinfo_for_update(llama_context * ctx, int32_t n_accepted) {
-    return ctx->mtp_prepare_sinfo_for_update(n_accepted);
-}
-
-void llama_mtp_cancel_sinfo_update(llama_context * ctx) {
-    ctx->mtp_cancel_sinfo_update();
 }
 
 void llama_synchronize(llama_context * ctx) {

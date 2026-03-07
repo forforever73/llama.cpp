@@ -173,7 +173,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
-    COMMON_SPECULATIVE_TYPE_MTP,           // multi-token prediction (uses same model, no draft)
+    COMMON_SPECULATIVE_TYPE_MTP,           // multi-token prediction (uses same model, dedicated draft context)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -283,7 +283,7 @@ struct common_params_speculative {
 
     llama_model * model_dft = nullptr; // a llama_model that can be shared by multiple speculative contexts
 
-    llama_context_params cparams_dft; // these are the parameters for the draft llama_context
+    llama_context_params cparams_dft = llama_context_default_params(); // these are the parameters for the draft llama_context
 
     int32_t n_ctx        = 0;  // draft context size
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
@@ -301,6 +301,10 @@ struct common_params_speculative {
 
     bool has_dft() const {
         return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();
+    }
+
+    bool requires_dft() const {
+        return type == COMMON_SPECULATIVE_TYPE_DRAFT || type == COMMON_SPECULATIVE_TYPE_EAGLE3;
     }
 };
 

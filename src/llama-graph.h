@@ -34,10 +34,8 @@ enum llm_graph_type {
 };
 
 enum llm_mtp_op_type {
-    LLM_MTP_OP_NONE            = 0,
-    LLM_MTP_OP_WARMUP          = 1,
-    LLM_MTP_OP_DRAFT_GEN       = 2,
-    LLM_MTP_OP_UPDATE_ACCEPTED = 3,
+    LLM_MTP_OP_NONE      = 0,
+    LLM_MTP_OP_DRAFT_GEN = 1,
 };
 
 enum llm_ffn_op_type {

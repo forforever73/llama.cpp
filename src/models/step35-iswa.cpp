@@ -152,6 +152,7 @@ llm_build_step35_iswa::llm_build_step35_iswa(const llama_model & model, const ll
 
     if (mtp_op_type != LLM_MTP_OP_NONE) {
         // === MTP graph branch ===
+        GGML_ASSERT(mtp_hidden_state != nullptr);
         const int il = mtp_layer_idx;
         GGML_ASSERT(il >= n_layer_main && il < n_layer);
         const auto & layer = model.layers[il];

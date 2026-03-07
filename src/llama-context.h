@@ -14,7 +14,6 @@
 
 struct llama_model;
 class llama_batch_allocr;
-struct llama_context_kv_cache_data;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -109,10 +108,6 @@ struct llama_context {
     void set_mtp_op_type(llama_mtp_op_type op);
     void set_mtp_layer_idx(int32_t layer_idx);
     void set_draft_input_hidden_state(const float * hidden_state);
-
-    bool mtp_prepare_sinfo_for_warmup();
-    bool mtp_prepare_sinfo_for_update(int32_t n_accepted);
-    void mtp_cancel_sinfo_update();
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -273,7 +268,6 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::unique_ptr<llama_memory_i> memory;
-    std::unique_ptr<llama_context_kv_cache_data> kv_cache_data;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
