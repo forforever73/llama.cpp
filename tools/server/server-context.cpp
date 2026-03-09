@@ -475,6 +475,7 @@ static void server_slot_append_mtp_prompt_hidden(
         const llama_batch & batch_view) {
     if (slot.spec == nullptr ||
             slot.task == nullptr ||
+            !slot.can_speculate() ||
             slot.task->params.speculative.type != COMMON_SPECULATIVE_TYPE_MTP ||
             (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT)) {
         return;
