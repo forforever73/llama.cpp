@@ -1,5 +1,6 @@
 #include "speculative.h"
 
+#include "../src/llama-kv-cache-iswa.h"
 #include "common.h"
 #include "ggml.h"
 #include "llama.h"
@@ -764,6 +765,13 @@ static bool copy_hidden_state(
 }
 
 struct common_speculative_state_mtp : public common_speculative_state {
+    enum mtp_draft_step_status : int {
+        MTP_DRAFT_STEP_GUARD_STOP = -2,
+        MTP_DRAFT_STEP_DECODE_FAIL = -1,
+        MTP_DRAFT_STEP_STOP = 0,
+        MTP_DRAFT_STEP_CONTINUE = 1,
+    };
+
     llama_context * ctx_tgt;
     llama_context * ctx_dft;
 
@@ -787,6 +795,14 @@ struct common_speculative_state_mtp : public common_speculative_state {
     llama_tokens saved_draft_tokens;
     std::vector<float> recurrence_hidden;
 
+    llama_kv_cache_iswa * draft_kv_iswa = nullptr;
+
+    size_t n_guard_stop_rounds = 0;             //因 guard 找不到安全位置而主动保守退出的轮次数
+    size_t n_guard_zero_draft_rounds = 0;       //其中一上来就退化成 0-draft 的次数
+    size_t n_guard_partial_rounds = 0;          //其中已经生成了一部分 draft，但没跑满上限就被 guard 截停的次数
+    size_t n_guard_lost_tokens = 0;             //因 guard 退化而少生成的 draft token 总数，计算方式就是 n_max - drafted
+    size_t n_draft_decode_fail_rounds = 0;      //与 guard 无关的普通 draft decode 失败次数
+
     common_speculative_state_mtp(
             enum common_speculative_type type,
             llama_context * ctx_tgt,
@@ -803,6 +819,9 @@ struct common_speculative_state_mtp : public common_speculative_state {
         sparams.samplers = {
             COMMON_SAMPLER_TYPE_TOP_K,
         };
+
+        auto * mem = llama_get_memory(ctx_dft);
+        draft_kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem);
 
         smpl = common_sampler_init(llama_get_model(ctx_dft), sparams);
         recurrence_hidden.resize(n_embd);
@@ -858,6 +877,64 @@ struct common_speculative_state_mtp : public common_speculative_state {
         prompt_hidden_states.assign(hidden_states, hidden_states + (int64_t) n_tokens*n_embd);
     }
 
+    bool supports_swa_guard() const {
+        return draft_kv_iswa != nullptr;
+    }
+
+    void set_swa_guard(llama_pos query_pos) {
+        GGML_ASSERT(draft_kv_iswa != nullptr);
+        draft_kv_iswa->set_swa_reuse_guard(query_pos);
+    }
+
+    void clear_swa_guard() {
+        if (draft_kv_iswa != nullptr) {
+            draft_kv_iswa->clear_swa_reuse_guard();
+        }
+    }
+
+    int classify_decode_failure() {
+        const bool blocked = draft_kv_iswa != nullptr
+            ? draft_kv_iswa->consume_swa_reuse_guard_block_prepare()
+            : false;
+
+        return blocked
+            ? MTP_DRAFT_STEP_GUARD_STOP
+            : MTP_DRAFT_STEP_DECODE_FAIL;
+    }
+
+    void record_guard_stop(const common_params_speculative & params, size_t drafted_tokens) {
+        ++n_guard_stop_rounds;
+        n_guard_lost_tokens += params.n_max > (int32_t) drafted_tokens ? params.n_max - drafted_tokens : 0;
+
+        const bool zero_draft = drafted_tokens == 0;
+        if (zero_draft) {
+            ++n_guard_zero_draft_rounds;
+        } else {
+            ++n_guard_partial_rounds;
+        }
+
+        LOG_DBG("%s: MTP draft stopped by SWA guard: saved_prompt_size = %d, drafted = %zu/%d, zero_draft = %d\n",
+                __func__,
+                (int) saved_prompt_size,
+                drafted_tokens,
+                params.n_max,
+                zero_draft);
+    }
+
+    void record_decode_fail() {
+        ++n_draft_decode_fail_rounds;
+    }
+
+    void record_step_failure(int step_status, const common_params_speculative & params, size_t drafted_tokens) {
+        GGML_ASSERT(step_status < 0);
+
+        if (step_status == MTP_DRAFT_STEP_GUARD_STOP) {
+            record_guard_stop(params, drafted_tokens);
+        } else {
+            record_decode_fail();
+        }
+    }
+
     int run_first_pass(
             const llama_tokens &       source_tokens,
             const std::vector<float> & source_hidden_states,
@@ -887,9 +964,10 @@ struct common_speculative_state_mtp : public common_speculative_state {
         llama_set_draft_input_hidden_state(ctx_dft, source_hidden_states.data());
 
         if (llama_decode(ctx_dft, batch) != 0) {
+            const int status = classify_decode_failure();
             llama_set_mtp_op_type(ctx_dft, LLAMA_MTP_OP_NONE);
             llama_set_draft_input_hidden_state(ctx_dft, nullptr);
-            return -1;
+            return status;
         }
 
         verified_pos_end = start_pos + n_tokens;
@@ -899,7 +977,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
         if (!cur_p || cur_p->size == 0) {
             llama_set_mtp_op_type(ctx_dft, LLAMA_MTP_OP_NONE);
             llama_set_draft_input_hidden_state(ctx_dft, nullptr);
-            return -1;
+            return MTP_DRAFT_STEP_DECODE_FAIL;
         }
 
         const llama_token id = cur_p->data[0].id;
@@ -912,14 +990,14 @@ struct common_speculative_state_mtp : public common_speculative_state {
         if (next_hidden == nullptr) {
             llama_set_mtp_op_type(ctx_dft, LLAMA_MTP_OP_NONE);
             llama_set_draft_input_hidden_state(ctx_dft, nullptr);
-            return -1;
+            return MTP_DRAFT_STEP_DECODE_FAIL;
         }
         std::memcpy(recurrence_hidden.data(), next_hidden, n_embd*sizeof(float));
 
         llama_set_mtp_op_type(ctx_dft, LLAMA_MTP_OP_NONE);
         llama_set_draft_input_hidden_state(ctx_dft, nullptr);
 
-        return p >= params.p_min ? 1 : 0;
+        return p >= params.p_min ? MTP_DRAFT_STEP_CONTINUE : MTP_DRAFT_STEP_STOP;
     }
 
     int run_single_token_step(
@@ -935,9 +1013,10 @@ struct common_speculative_state_mtp : public common_speculative_state {
         llama_set_draft_input_hidden_state(ctx_dft, recurrence_hidden.data());
 
         if (llama_decode(ctx_dft, batch) != 0) {
+            const int status = classify_decode_failure();
             llama_set_mtp_op_type(ctx_dft, LLAMA_MTP_OP_NONE);
             llama_set_draft_input_hidden_state(ctx_dft, nullptr);
-            return -1;
+            return status;
         }
 
         common_sampler_sample(smpl, ctx_dft, 0, true);
@@ -945,7 +1024,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
         if (!cur_p || cur_p->size == 0) {
             llama_set_mtp_op_type(ctx_dft, LLAMA_MTP_OP_NONE);
             llama_set_draft_input_hidden_state(ctx_dft, nullptr);
-            return -1;
+            return MTP_DRAFT_STEP_DECODE_FAIL;
         }
 
         const llama_token id = cur_p->data[0].id;
@@ -958,14 +1037,14 @@ struct common_speculative_state_mtp : public common_speculative_state {
         if (next_hidden == nullptr) {
             llama_set_mtp_op_type(ctx_dft, LLAMA_MTP_OP_NONE);
             llama_set_draft_input_hidden_state(ctx_dft, nullptr);
-            return -1;
+            return MTP_DRAFT_STEP_DECODE_FAIL;
         }
         std::memcpy(recurrence_hidden.data(), next_hidden, n_embd*sizeof(float));
 
         llama_set_mtp_op_type(ctx_dft, LLAMA_MTP_OP_NONE);
         llama_set_draft_input_hidden_state(ctx_dft, nullptr);
 
-        return p >= params.p_min ? 1 : 0;
+        return p >= params.p_min ? MTP_DRAFT_STEP_CONTINUE : MTP_DRAFT_STEP_STOP;
     }
 
     void draft(
@@ -980,62 +1059,82 @@ struct common_speculative_state_mtp : public common_speculative_state {
         saved_prompt_size = (llama_pos) prompt_tgt.size();
         saved_draft_tokens.clear();
 
-        if (auto * mem = llama_get_memory(ctx_dft)) {
-            llama_memory_seq_rm(mem, 0, verified_pos_end, -1);
-        }
-
-        const llama_tokens * source_tokens = nullptr;
-        const std::vector<float> * source_hidden_states = nullptr;
-        llama_pos source_start_pos = 0;
-
-        if (!pending_target_tokens.empty()) {
-            source_tokens = &pending_target_tokens;
-            source_hidden_states = &pending_hidden_states;
-            source_start_pos = pending_start_pos;
-        } else {
-            source_tokens = &prompt_tgt;
-            source_hidden_states = &prompt_hidden_states;
-            source_start_pos = 0;
-        }
-
-        if (source_tokens->empty()) {
-            return;
-        }
-
-        common_sampler_reset(smpl);
-
-        const int first_pass_status = run_first_pass(*source_tokens, *source_hidden_states, source_start_pos, id_last, params, result);
-        if (first_pass_status < 0) {
+        auto * mem = llama_get_memory(ctx_dft);
+        if (mem == nullptr || !supports_swa_guard()) {
+            LOG_WRN("%s: MTP draft requires llama_kv_cache or llama_kv_cache_iswa memory\n", __func__);
+            record_decode_fail();
             pending_target_tokens.clear();
             pending_hidden_states.clear();
             return;
         }
+        set_swa_guard(saved_prompt_size);
 
-        pending_target_tokens.clear();
-        pending_hidden_states.clear();
+        do {
+            llama_memory_seq_rm(mem, 0, verified_pos_end, -1);
 
-        if (!result.empty()) {
-            saved_draft_tokens.push_back(result.back());
-        }
+            const llama_tokens * source_tokens = nullptr;
+            const std::vector<float> * source_hidden_states = nullptr;
+            llama_pos source_start_pos = 0;
 
-        if (first_pass_status == 0) {
-            return;
-        }
+            if (!pending_target_tokens.empty()) {
+                source_tokens = &pending_target_tokens;
+                source_hidden_states = &pending_hidden_states;
+                source_start_pos = pending_start_pos;
+            } else {
+                source_tokens = &prompt_tgt;
+                source_hidden_states = &prompt_hidden_states;
+                source_start_pos = 0;
+            }
 
-        llama_pos next_pos = verified_pos_end;
-        while ((int) result.size() < params.n_max) {
-            const size_t result_size_prev = result.size();
-            const int step_status = run_single_token_step(result.back(), next_pos, params, result);
-            if (result.size() == result_size_prev) {
+            if (source_tokens->empty()) {
                 break;
             }
 
-            saved_draft_tokens.push_back(result.back());
-            next_pos++;
-            if (step_status <= 0) {
+            common_sampler_reset(smpl);
+
+            const int first_pass_status = run_first_pass(*source_tokens, *source_hidden_states, source_start_pos, id_last, params, result);
+            if (first_pass_status < 0) {
+                record_step_failure(first_pass_status, params, result.size());
+                pending_target_tokens.clear();
+                pending_hidden_states.clear();
                 break;
             }
-        }
+
+            pending_target_tokens.clear();
+            pending_hidden_states.clear();
+
+            if (!result.empty()) {
+                saved_draft_tokens.push_back(result.back());
+            }
+
+            if (first_pass_status != MTP_DRAFT_STEP_CONTINUE) {
+                break;
+            }
+
+            llama_pos next_pos = verified_pos_end;
+            while ((int) result.size() < params.n_max) {
+                const size_t result_size_prev = result.size();
+                const int step_status = run_single_token_step(result.back(), next_pos, params, result);
+                if (result.size() == result_size_prev) {
+                    if (step_status < 0) {
+                        record_step_failure(step_status, params, result.size());
+                    }
+                    break;
+                }
+
+                saved_draft_tokens.push_back(result.back());
+                next_pos++;
+                if (step_status == MTP_DRAFT_STEP_STOP) {
+                    break;
+                }
+                if (step_status < 0) {
+                    record_step_failure(step_status, params, result.size());
+                    break;
+                }
+            }
+        } while (false);
+
+        clear_swa_guard();
     }
 
     void accept(uint16_t n_accepted, const std::vector<int32_t> & batch_idxs) override {
@@ -1295,7 +1394,19 @@ common_speculative * common_speculative_init(
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_MTP: {
-                if (llama_model_n_nextn_predict_layers(llama_get_model(ctx_tgt)) <= 0) {
+                const llama_model * model_tgt = llama_get_model(ctx_tgt);
+
+                if (llama_model_is_recurrent(model_tgt)) {
+                    LOG_WRN("%s: MTP speculative does not support recurrent memory models yet\n", __func__);
+                    break;
+                }
+
+                if (llama_model_is_hybrid(model_tgt)) {
+                    LOG_WRN("%s: MTP speculative does not support hybrid memory models yet\n", __func__);
+                    break;
+                }
+
+                if (llama_model_n_nextn_predict_layers(model_tgt) <= 0) {
                     LOG_WRN("%s: target model has no nextn_predict_layers\n", __func__);
                     break;
                 }
@@ -1323,6 +1434,14 @@ common_speculative * common_speculative_init(
                 llama_context * ctx_mtp = llama_init_from_model(const_cast<llama_model *>(llama_get_model(ctx_tgt)), cparams);
                 if (ctx_mtp == nullptr) {
                     LOG_WRN("%s", "failed to initialize dedicated MTP draft context\n");
+                    break;
+                }
+
+                auto * mem_mtp = llama_get_memory(ctx_mtp);
+                if (dynamic_cast<llama_kv_cache_iswa *>(mem_mtp) == nullptr) {
+                    LOG_WRN("%s: MTP draft context requires llama_kv_cache_iswa memory for current SWA/iSWA rollback guard\n",
+                            __func__);
+                    llama_free(ctx_mtp);
                     break;
                 }
 
@@ -1455,5 +1574,15 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_gen_tokens,
                 impl->n_acc_tokens,
                 str_perf.c_str());
+
+        if (auto * mtp = dynamic_cast<const common_speculative_state_mtp *>(impl.get())) {
+            LOG_INF("statistics %s: guard stops = %zu, zero-draft guard stops = %zu, partial guard stops = %zu, guard lost tokens = %zu, draft decode fail rounds = %zu\n",
+                    common_speculative_type_to_str(impl->type).c_str(),
+                    mtp->n_guard_stop_rounds,
+                    mtp->n_guard_zero_draft_rounds,
+                    mtp->n_guard_partial_rounds,
+                    mtp->n_guard_lost_tokens,
+                    mtp->n_draft_decode_fail_rounds);
+        }
     }
 }

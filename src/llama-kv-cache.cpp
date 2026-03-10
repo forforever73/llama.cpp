@@ -17,6 +17,21 @@
 // llama_kv_cache
 //
 
+static bool llama_kv_cache_is_swa_cell_reusable_for_query(
+        uint32_t       n_swa,
+        llama_swa_type swa_type,
+        llama_pos      pos_cell,
+        llama_pos      query_pos) {
+    if (n_swa == 0 || swa_type == LLAMA_SWA_TYPE_NONE) {
+        return false;
+    }
+
+    GGML_ASSERT(pos_cell >= 0);
+    GGML_ASSERT(query_pos >= 0);
+
+    return llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, query_pos);
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
                 ggml_type   type_k,
@@ -573,6 +588,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
 
+    swa_reuse_guard_blocked_prepare = false;
+
     bool success = true;
 
     for (const auto & ubatch : ubatches) {
@@ -818,6 +835,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         }
 
         uint32_t n_tested = 0;
+        bool guard_blocked = false;
 
         // for continuous slots, we test that all tokens in the ubatch fit, starting from the current head
         // for non-continuous slots, we test the tokens one by one
@@ -858,9 +876,28 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
                     if (!can_use) {
                         const llama_seq_id seq_id_cell = cells.seq_get(idx);
+                        const llama_pos query_pos_default = cells.seq_pos_max(seq_id_cell) + 1;
 
                         // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                        if (swa_reuse_guard.active) {
+                            const bool can_use_default = llama_kv_cache_is_swa_cell_reusable_for_query(
+                                    n_swa,
+                                    swa_type,
+                                    pos_cell,
+                                    query_pos_default);
+                            const bool can_use_guarded = llama_kv_cache_is_swa_cell_reusable_for_query(
+                                    n_swa,
+                                    swa_type,
+                                    pos_cell,
+                                    swa_reuse_guard.query_pos);
+
+                            can_use = can_use_guarded;
+                            guard_blocked = guard_blocked || (can_use_default && !can_use_guarded);
+                        } else if (llama_kv_cache_is_swa_cell_reusable_for_query(
+                                           n_swa,
+                                           swa_type,
+                                           pos_cell,
+                                           query_pos_default)) {
                             can_use = true;
                         }
                     }
@@ -884,6 +921,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             }
 
             if (n_tested >= cells.size()) {
+                swa_reuse_guard_blocked_prepare = swa_reuse_guard_blocked_prepare || guard_blocked;
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                 return { };
             }
@@ -999,6 +1037,25 @@ bool llama_kv_cache::get_has_shift() const {
     }
 
     return result;
+}
+
+void llama_kv_cache::set_swa_reuse_guard(llama_pos query_pos) {
+    GGML_ASSERT(query_pos >= 0);
+
+    swa_reuse_guard.active = true;
+    swa_reuse_guard.query_pos = query_pos;
+    swa_reuse_guard_blocked_prepare = false;
+}
+
+void llama_kv_cache::clear_swa_reuse_guard() {
+    swa_reuse_guard.active = false;
+    swa_reuse_guard.query_pos = 0;
+}
+
+bool llama_kv_cache::consume_swa_reuse_guard_block_prepare() {
+    const bool blocked = swa_reuse_guard_blocked_prepare;
+    swa_reuse_guard_blocked_prepare = false;
+    return blocked;
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {

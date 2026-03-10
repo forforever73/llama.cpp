@@ -13,6 +13,11 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+struct llama_kv_swa_guard_state {
+    bool active = false;
+    llama_pos query_pos = 0;
+};
+
 //
 // llama_kv_cache
 //
@@ -152,6 +157,11 @@ public:
 
     bool get_has_shift() const;
 
+    void set_swa_reuse_guard(llama_pos query_pos);
+    void clear_swa_reuse_guard();
+
+    bool consume_swa_reuse_guard_block_prepare();
+
     //
     // graph_build API
     //
@@ -246,6 +256,9 @@ private:
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
+
+    llama_kv_swa_guard_state swa_reuse_guard;
+    mutable bool swa_reuse_guard_blocked_prepare = false;
 
     std::vector<kv_layer> layers;
 

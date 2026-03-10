@@ -247,6 +247,20 @@ llama_kv_cache * llama_kv_cache_iswa::get_swa() const {
     return kv_swa.get();
 }
 
+void llama_kv_cache_iswa::set_swa_reuse_guard(llama_pos query_pos) {
+    kv_base->clear_swa_reuse_guard();
+    kv_swa->set_swa_reuse_guard(query_pos);
+}
+
+void llama_kv_cache_iswa::clear_swa_reuse_guard() {
+    kv_base->clear_swa_reuse_guard();
+    kv_swa->clear_swa_reuse_guard();
+}
+
+bool llama_kv_cache_iswa::consume_swa_reuse_guard_block_prepare() {
+    return kv_swa->consume_swa_reuse_guard_block_prepare();
+}
+
 //
 // llama_kv_cache_iswa_context
 //

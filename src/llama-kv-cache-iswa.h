@@ -70,6 +70,11 @@ public:
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_swa () const;
 
+    void set_swa_reuse_guard(llama_pos query_pos);
+    void clear_swa_reuse_guard();
+
+    bool consume_swa_reuse_guard_block_prepare();
+
 private:
     const llama_hparams & hparams;
 
