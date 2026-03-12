@@ -131,6 +131,10 @@ struct common_speculative_state {
     virtual ~common_speculative_state() = default;
 
     virtual void begin(const llama_tokens & prompt) = 0;
+    virtual void begin(const llama_tokens & prompt, llama_pos retained_prefix_len) {
+        GGML_UNUSED(retained_prefix_len);
+        begin(prompt);
+    }
 
     virtual void draft(
             const common_params_speculative & params,
@@ -139,6 +143,26 @@ struct common_speculative_state {
             llama_tokens & result) = 0;
 
     virtual void accept(uint16_t n_accepted, const std::vector<int32_t> & batch_idxs) = 0;
+
+    virtual llama_pos get_committed_prefix_len() const {
+        return 0;
+    }
+
+    virtual void invalidate_retained_state() {
+    }
+
+    virtual void set_first_pass_source(
+            const llama_tokens & source_tokens,
+            const float *        hidden_states,
+            int32_t              n_tokens,
+            int32_t              n_embd,
+            llama_pos            start_pos) {
+        GGML_UNUSED(source_tokens);
+        GGML_UNUSED(hidden_states);
+        GGML_UNUSED(n_tokens);
+        GGML_UNUSED(n_embd);
+        GGML_UNUSED(start_pos);
+    }
 
     virtual void set_prompt_hidden_states(
             const float * hidden_states,
@@ -784,9 +808,13 @@ struct common_speculative_state_mtp : public common_speculative_state {
     llama_token  saved_frontier_token = 0;
     llama_pos    saved_prompt_size    = 0;
     llama_pos    verified_pos_end     = 0;
+    llama_pos    committed_prefix_len = 0;
+    llama_pos    initial_source_start_pos = 0;
 
     llama_tokens prompt_tokens;
     std::vector<float> prompt_hidden_states;
+    llama_tokens initial_source_tokens;
+    std::vector<float> initial_source_hidden_states;
 
     llama_tokens pending_target_tokens;
     std::vector<float> pending_hidden_states;
@@ -796,6 +824,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
     std::vector<float> recurrence_hidden;
 
     llama_kv_cache_iswa * draft_kv_iswa = nullptr;
+    bool retained_state_valid = true;
 
     size_t n_guard_stop_rounds = 0;             //因 guard 找不到安全位置而主动保守退出的轮次数
     size_t n_guard_zero_draft_rounds = 0;       //其中一上来就退化成 0-draft 的次数
@@ -837,8 +866,14 @@ struct common_speculative_state_mtp : public common_speculative_state {
     }
 
     void begin(const llama_tokens & prompt) override {
+        begin(prompt, 0);
+    }
+
+    void begin(const llama_tokens & prompt, llama_pos retained_prefix_len) override {
         prompt_tokens = prompt;
         prompt_hidden_states.clear();
+        initial_source_tokens.clear();
+        initial_source_hidden_states.clear();
         pending_target_tokens.clear();
         pending_hidden_states.clear();
         saved_draft_tokens.clear();
@@ -846,12 +881,35 @@ struct common_speculative_state_mtp : public common_speculative_state {
         saved_frontier_token = 0;
         saved_prompt_size = 0;
         pending_start_pos = 0;
-        verified_pos_end = 0;
+        initial_source_start_pos = 0;
 
-        if (auto * mem = llama_get_memory(ctx_dft)) {
-            llama_memory_clear(mem, true);
+        retained_prefix_len = std::max<llama_pos>(retained_prefix_len, 0);
+
+        llama_pos retained_prefix_applied = 0;
+        if (retained_state_valid) {
+            retained_prefix_applied = std::min(retained_prefix_len, committed_prefix_len);
+            if (retained_prefix_applied != retained_prefix_len) {
+                LOG_WRN("%s: clamping retained prefix from %d to committed prefix %d\n",
+                        __func__, (int) retained_prefix_len, (int) committed_prefix_len);
+            }
         }
 
+        verified_pos_end = retained_prefix_applied;
+        committed_prefix_len = retained_prefix_applied;
+
+        if (auto * mem = llama_get_memory(ctx_dft)) {
+            if (retained_prefix_applied == 0) {
+                llama_memory_clear(mem, true);
+            } else if (!llama_memory_seq_rm(mem, 0, retained_prefix_applied, -1)) {
+                LOG_WRN("%s: failed to truncate retained draft state at %d - clearing memory instead\n",
+                        __func__, (int) retained_prefix_applied);
+                llama_memory_clear(mem, true);
+                verified_pos_end = 0;
+                committed_prefix_len = 0;
+            }
+        }
+
+        retained_state_valid = true;
         common_sampler_reset(smpl);
         llama_set_mtp_op_type(ctx_dft, LLAMA_MTP_OP_NONE);
         llama_set_draft_input_hidden_state(ctx_dft, nullptr);
@@ -874,7 +932,76 @@ struct common_speculative_state_mtp : public common_speculative_state {
             return;
         }
 
+        if (!prompt_tokens.empty() && n_tokens != (int32_t) prompt_tokens.size()) {
+            LOG_WRN("%s: ignoring prompt hidden states with mismatched token count (%d != %zu)\n",
+                    __func__, n_tokens, prompt_tokens.size());
+            prompt_hidden_states.clear();
+            return;
+        }
+
         prompt_hidden_states.assign(hidden_states, hidden_states + (int64_t) n_tokens*n_embd);
+    }
+
+    llama_pos get_committed_prefix_len() const override {
+        return retained_state_valid ? committed_prefix_len : 0;
+    }
+
+    void invalidate_retained_state() override {
+        retained_state_valid = false;
+        committed_prefix_len = 0;
+        verified_pos_end = 0;
+        pending_start_pos = 0;
+        initial_source_start_pos = 0;
+        initial_source_tokens.clear();
+        initial_source_hidden_states.clear();
+        pending_target_tokens.clear();
+        pending_hidden_states.clear();
+        saved_draft_tokens.clear();
+
+        if (auto * mem = llama_get_memory(ctx_dft)) {
+            llama_memory_clear(mem, true);
+        }
+
+        common_sampler_reset(smpl);
+        llama_set_mtp_op_type(ctx_dft, LLAMA_MTP_OP_NONE);
+        llama_set_draft_input_hidden_state(ctx_dft, nullptr);
+        llama_synchronize(ctx_dft);
+    }
+
+    void set_first_pass_source(
+            const llama_tokens & source_tokens,
+            const float *        hidden_states,
+            int32_t              n_tokens,
+            int32_t              n_embd_in,
+            llama_pos            start_pos) override {
+        initial_source_tokens.clear();
+        initial_source_hidden_states.clear();
+        initial_source_start_pos = 0;
+
+        if (n_tokens <= 0 || source_tokens.empty()) {
+            return;
+        }
+
+        if ((int32_t) source_tokens.size() != n_tokens) {
+            LOG_WRN("%s: ignoring first-pass source with mismatched token count (%zu != %d)\n",
+                    __func__, source_tokens.size(), n_tokens);
+            return;
+        }
+
+        if (hidden_states == nullptr) {
+            LOG_WRN("%s: ignoring first-pass source without hidden states\n", __func__);
+            return;
+        }
+
+        if (n_embd_in != n_embd) {
+            LOG_WRN("%s: ignoring first-pass source with mismatched n_embd (%d != %d)\n",
+                    __func__, n_embd_in, n_embd);
+            return;
+        }
+
+        initial_source_tokens = source_tokens;
+        initial_source_hidden_states.assign(hidden_states, hidden_states + (int64_t) n_tokens*n_embd);
+        initial_source_start_pos = start_pos;
     }
 
     bool supports_swa_guard() const {
@@ -970,8 +1097,6 @@ struct common_speculative_state_mtp : public common_speculative_state {
             return status;
         }
 
-        verified_pos_end = start_pos + n_tokens;
-
         common_sampler_sample(smpl, ctx_dft, n_tokens - 1, true);
         const auto * cur_p = common_sampler_get_candidates(smpl, true);
         if (!cur_p || cur_p->size == 0) {
@@ -993,6 +1118,10 @@ struct common_speculative_state_mtp : public common_speculative_state {
             return MTP_DRAFT_STEP_DECODE_FAIL;
         }
         std::memcpy(recurrence_hidden.data(), next_hidden, n_embd*sizeof(float));
+
+        verified_pos_end = start_pos + n_tokens;
+        committed_prefix_len = verified_pos_end;
+        retained_state_valid = true;
 
         llama_set_mtp_op_type(ctx_dft, LLAMA_MTP_OP_NONE);
         llama_set_draft_input_hidden_state(ctx_dft, nullptr);
@@ -1080,6 +1209,10 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 source_tokens = &pending_target_tokens;
                 source_hidden_states = &pending_hidden_states;
                 source_start_pos = pending_start_pos;
+            } else if (!initial_source_tokens.empty()) {
+                source_tokens = &initial_source_tokens;
+                source_hidden_states = &initial_source_hidden_states;
+                source_start_pos = initial_source_start_pos;
             } else {
                 source_tokens = &prompt_tgt;
                 source_hidden_states = &prompt_hidden_states;
@@ -1093,6 +1226,9 @@ struct common_speculative_state_mtp : public common_speculative_state {
             common_sampler_reset(smpl);
 
             const int first_pass_status = run_first_pass(*source_tokens, *source_hidden_states, source_start_pos, id_last, params, result);
+            initial_source_tokens.clear();
+            initial_source_hidden_states.clear();
+            initial_source_start_pos = 0;
             if (first_pass_status < 0) {
                 record_step_failure(first_pass_status, params, result.size());
                 pending_target_tokens.clear();
@@ -1475,13 +1611,20 @@ void common_speculative_free(common_speculative * spec) {
 }
 
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt) {
+    common_speculative_begin(spec, prompt, 0);
+}
+
+void common_speculative_begin(
+        common_speculative * spec,
+        const llama_tokens & prompt,
+        llama_pos            retained_prefix_len) {
     if (spec == nullptr) {
         return;
     }
 
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
-        impl->begin(prompt);
+        impl->begin(prompt, retained_prefix_len);
         impl->n_call_begin++;
     }
 }
@@ -1497,6 +1640,47 @@ void common_speculative_set_prompt_hidden_states(
 
     for (auto & impl : spec->impls) {
         impl->set_prompt_hidden_states(hidden_states, n_tokens, n_embd);
+    }
+}
+
+llama_pos common_speculative_get_committed_prefix_len(
+        const common_speculative * spec) {
+    if (spec == nullptr) {
+        return 0;
+    }
+
+    llama_pos result = 0;
+    for (const auto & impl : spec->impls) {
+        result = std::max(result, impl->get_committed_prefix_len());
+    }
+
+    return result;
+}
+
+void common_speculative_invalidate_retained_state(
+        common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->invalidate_retained_state();
+    }
+}
+
+void common_speculative_set_first_pass_source(
+        common_speculative * spec,
+        const llama_tokens & source_tokens,
+        const float *        hidden_states,
+        int32_t              n_tokens,
+        int32_t              n_embd,
+        llama_pos            start_pos) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->set_first_pass_source(source_tokens, hidden_states, n_tokens, n_embd, start_pos);
     }
 }
 

@@ -26,12 +26,30 @@ void common_speculative_free(common_speculative * spec);
 
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
+void common_speculative_begin(
+        common_speculative * spec,
+        const llama_tokens & prompt,
+        llama_pos            retained_prefix_len);
 
 void common_speculative_set_prompt_hidden_states(
         common_speculative * spec,
               const float * hidden_states,
                     int32_t n_tokens,
                     int32_t n_embd);
+
+llama_pos common_speculative_get_committed_prefix_len(
+        const common_speculative * spec);
+
+void common_speculative_invalidate_retained_state(
+        common_speculative * spec);
+
+void common_speculative_set_first_pass_source(
+        common_speculative * spec,
+        const llama_tokens & source_tokens,
+        const float *        hidden_states,
+        int32_t              n_tokens,
+        int32_t              n_embd,
+        llama_pos            start_pos);
 
 // sample up to n_draft tokens and add them to the batch using the draft model
 llama_tokens common_speculative_draft(
