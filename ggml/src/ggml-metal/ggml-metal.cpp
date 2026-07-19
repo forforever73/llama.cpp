@@ -6,6 +6,7 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
+#include "ggml-metal-tuning.h"
 
 #include <mutex>
 #include <string>
@@ -868,11 +869,29 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
     GGML_UNUSED(reg);
 }
 
+static void ggml_backend_metal_set_mm_tile_override_impl(int16_t nr0, int16_t nr1) {
+    ggml_metal_tuning::mm_tile_set_override({ nr0, nr1 });
+}
+static void ggml_backend_metal_clear_mm_tile_override_impl() {
+    ggml_metal_tuning::mm_tile_clear_override();
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
-        return (void *)ggml_backend_metal_get_features;
+        return (void *) ggml_backend_metal_get_features;
     }
-
+    if (strcmp(name, "ggml_backend_metal_set_mm_tile_override") == 0) {
+        return (void *) ggml_backend_metal_set_mm_tile_override_impl;
+    }
+    if (strcmp(name, "ggml_backend_metal_clear_mm_tile_override") == 0) {
+        return (void *) ggml_backend_metal_clear_mm_tile_override_impl;
+    }
+    if (strcmp(name, "ggml_backend_metal_mm_tile_K_bucket") == 0) {
+        return (void *)(int (*)(int64_t)) ggml_metal_tuning::mm_tile_K_bucket;
+    }
+    if (strcmp(name, "ggml_backend_metal_mm_tile_token_bucket") == 0) {
+        return (void *)(int (*)(int64_t)) ggml_metal_tuning::mm_tile_token_bucket;
+    }
     return NULL;
 
     GGML_UNUSED(reg);

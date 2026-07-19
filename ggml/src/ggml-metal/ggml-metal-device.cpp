@@ -1,9 +1,11 @@
 #include "ggml-metal-device.h"
+#include "ggml-metal-tuning.h"
 
 #include "ggml-metal-impl.h"
 
 #include "ggml-impl.h"
 
+#include <algorithm>
 #include <cassert>
 #include <memory>
 #include <string>
@@ -715,9 +717,39 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
 
+    // Pick (nr0, nr1) from the tuning table; falls back to (64,32) baseline.
+    // The tile kernel is only compiled for the non-tensor path, the four sweep dtypes, and src1=f32.
+    const bool tile_eligible = !has_tensor && tsrc1 == GGML_TYPE_F32 &&
+        (tsrc0 == GGML_TYPE_Q4_0 || tsrc0 == GGML_TYPE_Q8_0 ||
+         tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_F16);
+    const auto * dev_props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+    ggml_metal_tuning::mm_tile_cfg_t tile_cfg =
+        tile_eligible
+        ? ggml_metal_tuning::mm_tile_pick(
+              dev_props->device_id,
+              0,                             // gpu_family: PoC anchors on exact device_id; family fallback unused
+              (int) tsrc0,
+              (int64_t) op->src[0]->ne[0],   // K
+              (int64_t) op->src[1]->ne[1])   // tokens (ne11)
+        : ggml_metal_tuning::mm_tile_baseline_cfg();
+    const int mm_nr0 = tile_eligible ? (int) tile_cfg.nr0 : 64;
+    const int mm_nr1 = tile_eligible ? (int) tile_cfg.nr1 : 32;
+    const char * mm_variant = tile_eligible
+        ? ([](int nr0, int nr1) -> const char * {
+               if (nr0 ==  32 && nr1 ==  8) return "_tile_32x8_";
+               if (nr0 ==  32 && nr1 == 16) return "_tile_32x16_";
+               if (nr0 ==  64 && nr1 ==  8) return "_tile_64x8_";
+               if (nr0 ==  64 && nr1 == 16) return "_tile_64x16_";
+               if (nr0 ==  64 && nr1 == 32) return "_tile_64x32_";
+               if (nr0 == 128 && nr1 == 16) return "_tile_128x16_";
+               if (nr0 == 128 && nr1 == 32) return "_tile_128x32_";
+               return "";  // illegal config -> fall through to baseline kernel
+           })(mm_nr0, mm_nr1)
+        : "";
+
     const bool bc_out = has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
-        : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
+        : (op->ne[0] % mm_nr0 != 0 || op->ne[1] % mm_nr1 != 0);
 
     GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
     const int16_t ne12 = (int16_t) op->src[1]->ne[2];
@@ -725,7 +757,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    if (tile_eligible && mm_variant[0] != '\0') {
+        snprintf(base, 256, "kernel_mul_mm%s%s_%s",
+                 mm_variant, ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_%s_%s",
+                 ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    }
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
 
@@ -752,13 +790,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
         res.smem = smem_a;
     } else {
-        res.nr0 = 64;
-        res.nr1 = 32;
+        res.nr0 = mm_nr0;
+        res.nr1 = mm_nr1;
 
-        res.smem = bc_out ? 8192 : (4096 + 2048);
+        // smem = max(sa+sb, bc_out buffer): the writeback path reuses shmem as a
+        // NR0 x NR1 float scratch, which can exceed the sa+sb load buffers for large tiles.
+        const size_t NK = 32;
+        const size_t sa = (size_t) mm_nr0 * NK * sizeof(ggml_fp16_t);
+        const size_t sb = (size_t) mm_nr1 * NK * sizeof(ggml_fp16_t);
+        const size_t bc = (size_t) mm_nr0 * mm_nr1 * sizeof(float);
+        res.smem = bc_out ? std::max(sa + sb, bc) : (sa + sb);
     }
 
     res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+    if (tile_eligible && mm_variant[0] != '\0') {
+        const int N_SG = (mm_nr0 == 128) ? 8 : (mm_nr0 == 32) ? 2 : 4;
+        res.nsg = N_SG;
+    }
 
     return res;
 }

@@ -25,6 +25,7 @@
 #include <array>
 #include <cfloat>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -35,6 +36,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -478,6 +480,7 @@ enum test_mode {
     MODE_PERF,
     MODE_GRAD,
     MODE_SUPPORT,
+    MODE_TUNE,
 };
 
 // Output format support similar to llama-bench
@@ -9400,6 +9403,300 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 // Test cases for performance evaluation: should be representative of real-world use cases
+static bool g_mm_tune_perf = false;
+
+// ---- mul_mm tile (nr0,nr1) tuning: proc-bridge typedefs ----
+using set_mm_tile_override_t   = void (*)(int16_t, int16_t);
+using clear_mm_tile_override_t = void (*)(void);
+using mm_tile_bucket_t         = int  (*)(int64_t);
+
+// legal (nr0,nr1) pairs for the tile family
+static std::vector<std::pair<int,int>> mm_tile_legal_configs() {
+    return { {32,8}, {32,16}, {64,8}, {64,16}, {64,32}, {128,16}, {128,32} };
+}
+
+// Numerical gate: for each (dtype, K, tokens) point x legal (nr0,nr1), force the
+// override and compare metal vs CPU-ref via test_mul_mat::eval.
+static bool run_mm_tile_tune_check(ggml_backend_t backend_metal, ggml_backend_t backend_cpu) {
+    auto * reg  = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_metal));
+    auto set_ov = (set_mm_tile_override_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_mm_tile_override");
+    auto clr_ov = (clear_mm_tile_override_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_clear_mm_tile_override");
+    if (!set_ov || !clr_ov) { printf("metal mm_tile override proc unavailable\n"); return false; }
+
+    const ggml_type dtypes[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16 };
+    const int K_pts[]      = { 64, 128, 4096, 4097, 14336 };  // 64/128=minimal, 4097=odd K
+    const int tokens_pts[] = { 1, 4, 8, 9, 16, 32, 33 };      // straddle each bucket edge
+    // M fixed at 4032 (=63*64, exercises bc_out path since 4032%128!=0)
+    const int M = 4032;
+
+    bool ok = true;
+    int n_run = 0, n_fail = 0;
+    for (ggml_type dt : dtypes) {
+        for (int K : K_pts) {
+            if (K % ggml_blck_size(dt) != 0) { continue; }  // skip K not aligned to the dtype block
+            for (int tokens : tokens_pts) {
+                for (auto [nr0, nr1] : mm_tile_legal_configs()) {
+                    set_ov((int16_t)nr0, (int16_t)nr1);
+                    test_mul_mat tc(dt, GGML_TYPE_F32, M, tokens, K, {1,1}, {1,1});
+                    auto st = tc.eval(backend_metal, backend_cpu, "MUL_MAT", nullptr);
+                    clr_ov();
+                    if (st == test_status_t::FAIL) {
+                        printf("FAIL dt=%s M=%d K=%d tokens=%d nr0=%d nr1=%d\n",
+                               ggml_type_name(dt), M, K, tokens, nr0, nr1);
+                        ok = false; n_fail++;
+                    }
+                    n_run++;
+                }
+            }
+        }
+    }
+    printf("mm_tile tune-check: %d cases run, %d failed\n", n_run, n_fail);
+    return ok;
+}
+
+struct mm_perf_cell {
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf;
+    ggml_cgraph *           gf     = nullptr;
+    int                     n_runs = 0;
+    bool                    ok     = false;
+};
+
+static mm_perf_cell mm_build_perf_cell(ggml_backend_t backend,
+                                        ggml_type dt, int M, int K, int tokens) {
+    mm_perf_cell cell;
+    test_mul_mat tc(dt, GGML_TYPE_F32, M, tokens, K, {1,1}, {1,1});
+
+    const size_t graph_nodes = 1024;
+    ggml_init_params params = {
+        ggml_tensor_overhead() * 128 + ggml_graph_overhead_custom(graph_nodes, false),
+        NULL, true,
+    };
+    cell.ctx.reset(ggml_init(params));
+    GGML_ASSERT(cell.ctx);
+    ggml_tensor * out = tc.build_graph(cell.ctx.get());
+    if (!ggml_backend_supports_op(backend, out)) { return cell; }
+    cell.buf.reset(ggml_backend_alloc_ctx_tensors(cell.ctx.get(), backend));
+    if (!cell.buf) { return cell; }
+    tc.initialize_tensors(cell.ctx.get());
+    cell.gf = ggml_new_graph_custom(cell.ctx.get(), graph_nodes, false);
+    ggml_build_forward_expand(cell.gf, out);
+    cell.n_runs = 1;
+    if (tc.op_flops(out) > 0) {
+        const uint64_t target_flops = 50ULL * 1000 * 1000 * 1000;
+        const int cap = 512;
+        const int by_flops = (int) std::min<int64_t>(cap, (int64_t)(target_flops / tc.op_flops(out)));
+        cell.n_runs = std::max(1, std::min<int>(by_flops,
+            (int)(ggml_graph_size(cell.gf) - ggml_graph_n_nodes(cell.gf))));
+    }
+    for (int i = 1; i < cell.n_runs; ++i) { ggml_graph_add_node(cell.gf, out); }
+    cell.ok = true;
+    return cell;
+}
+
+static double time_mm_cell_median(ggml_backend_t backend, const mm_perf_cell & cell, int reps) {
+    if (!cell.ok) { return -1.0; }
+    ggml_backend_graph_compute(backend, cell.gf);
+    ggml_backend_synchronize(backend);
+    std::vector<double> samples;
+    samples.reserve(reps);
+    for (int r = 0; r < reps; ++r) {
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_graph_compute(backend, cell.gf);
+        ggml_backend_synchronize(backend);
+        samples.push_back((double)(ggml_time_us() - t0));
+    }
+    std::nth_element(samples.begin(), samples.begin() + samples.size()/2, samples.end());
+    return samples[samples.size()/2] / cell.n_runs;
+}
+
+// map a sweep dtype to its ggml_type enum spelling, for pasteable table rows
+static const char * mm_tile_dtype_enum_name(ggml_type dt) {
+    switch (dt) {
+        case GGML_TYPE_Q4_0: return "GGML_TYPE_Q4_0";
+        case GGML_TYPE_Q8_0: return "GGML_TYPE_Q8_0";
+        case GGML_TYPE_Q4_K: return "GGML_TYPE_Q4_K";
+        case GGML_TYPE_F16:  return "GGML_TYPE_F16";
+        default:             return "GGML_TYPE_COUNT";
+    }
+}
+
+static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
+    auto * reg  = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_metal));
+    auto set_ov = (set_mm_tile_override_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_mm_tile_override");
+    auto clr_ov = (clear_mm_tile_override_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_clear_mm_tile_override");
+    auto K_bkt  = (mm_tile_bucket_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_mm_tile_K_bucket");
+    auto tok_bkt= (mm_tile_bucket_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_mm_tile_token_bucket");
+    if (!set_ov || !clr_ov || !K_bkt || !tok_bkt) {
+        printf("metal mm_tile tuning procs unavailable\n");
+        return false;
+    }
+
+    // sweep grid (matches PoC make_test_cases_perf shape set)
+    const ggml_type dtypes[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16 };
+    const int K_rep[]      = { 4096, 14336 };
+    const int tokens_rep[] = { 1, 4, 8, 9, 16, 24, 32, 48 };
+    const int M = 4032;
+    const int REPS = 7;
+
+    const double TUNE_TAU   = 0.05;
+    const double TUNE_THETA = 1.05;
+    const auto   cfgs = mm_tile_legal_configs();  // {(nr0,nr1), ...}
+    const int    base_i = [&]() {
+        for (int i = 0; i < (int)cfgs.size(); ++i) {
+            if (cfgs[i].first == 64 && cfgs[i].second == 32) { return i; }
+        }
+        return 0;
+    }();
+
+    printf("# mm_tile perf sweep — replace GGML_METAL_DEVICE_M4_MAX with this machine's device\n");
+    printf("# Format: nr0xnr1=time_us* (* = winner); => cfg NR0xNR1 beats baseline, else => baseline\n");
+
+    for (ggml_type dt : dtypes) {
+        printf("\n### dtype=%s\n", ggml_type_name(dt));
+
+        struct pt_t { int K, tokens; std::vector<double> ts; double base_t; };
+        std::vector<pt_t> pts;
+
+        for (int K : K_rep) {
+            if (K % ggml_blck_size(dt) != 0) { continue; }  // skip K not aligned to the dtype block
+            for (int tokens : tokens_rep) {
+                mm_perf_cell cell = mm_build_perf_cell(backend_metal, dt, M, K, tokens);
+                if (!cell.ok) { continue; }
+
+                std::vector<double> ts(cfgs.size(), 0.0);
+                std::vector<int> order(cfgs.size());
+                std::iota(order.begin(), order.end(), 0);
+                std::shuffle(order.begin(), order.end(), std::mt19937(1234));
+
+                double anchor = 0.0;
+                for (int idx = 0; idx < (int)order.size(); ++idx) {
+                    int i = order[idx];
+                    set_ov((int16_t)cfgs[i].first, (int16_t)cfgs[i].second);
+                    ts[i] = time_mm_cell_median(backend_metal, cell, REPS);
+                    clr_ov();
+                    if (idx % 3 == 0) {
+                        // baseline re-measure for throttle detection
+                        set_ov(64, 32);
+                        double a = time_mm_cell_median(backend_metal, cell, REPS);
+                        clr_ov();
+                        if (anchor > 0.0) {
+                            double drift = std::abs(a - anchor) / anchor;
+                            if (drift > 0.10) {
+                                printf("# WARN throttle? drift=%.1f%% dt=%s K=%d\n",
+                                       100.0*drift, ggml_type_name(dt), K);
+                            }
+                        }
+                        anchor = (anchor > 0.0) ? std::min(anchor, a) : a;
+                    }
+                }
+
+                int best = 0;
+                for (int i = 1; i < (int)cfgs.size(); ++i) {
+                    if (ts[i] > 0.0 && (ts[best] <= 0.0 || ts[i] < ts[best])) { best = i; }
+                }
+                double base_t = ts[base_i];
+                printf("# dt=%s K=%d tokens=%d:", ggml_type_name(dt), K, tokens);
+                for (int i = 0; i < (int)cfgs.size(); ++i) {
+                    printf("  %dx%d=%.1f%s", cfgs[i].first, cfgs[i].second, ts[i],
+                           (i == best) ? "*" : "");
+                }
+                const bool keep = ts[best] > 0.0 && base_t > 0.0 && ts[best] < base_t * 0.98;
+                if (keep) { printf("  => %dx%d  %.2fx\n", cfgs[best].first, cfgs[best].second, base_t/ts[best]); }
+                else      { printf("  => baseline\n"); }
+                pts.push_back({ K, tokens, ts, base_t });
+            }
+        }
+
+        // group_split compression: per domain (decode/batch), find default cfg + exceptions
+        std::vector<std::string> rows_out;
+        char rbuf[256];
+        for (int dom = 0; dom <= 1; ++dom) {
+            std::vector<const pt_t *> db;
+            for (const auto & p : pts) {
+                bool is_decode = (p.tokens <= 8);
+                if ((dom == 0) == is_decode) { db.push_back(&p); }
+            }
+            if (db.empty()) { continue; }
+
+            // per-bucket aggregates
+            std::set<std::pair<int,int>> seen;
+            for (const auto * p : db) { seen.insert({ K_bkt(p->K), tok_bkt(p->tokens) }); }
+
+            struct bkt_t { int bK, btok; int Ti; std::vector<double> agg; double base_agg;
+                           std::vector<const pt_t*> bp; };
+            std::vector<bkt_t> bks;
+            for (const auto & bb : seen) {
+                int bK = bb.first, btok = bb.second;
+                std::vector<const pt_t*> bp;
+                for (const auto * p : db) {
+                    if (K_bkt(p->K) == bK && tok_bkt(p->tokens) == btok) { bp.push_back(p); }
+                }
+                std::vector<double> agg(cfgs.size(), 0.0), worst(cfgs.size(), 0.0);
+                for (const auto * p : bp) {
+                    double bestt = 0.0;
+                    for (int i = 0; i < (int)cfgs.size(); ++i) {
+                        if (p->ts[i] > 0.0 && (bestt == 0.0 || p->ts[i] < bestt)) { bestt = p->ts[i]; }
+                    }
+                    for (int i = 0; i < (int)cfgs.size(); ++i) {
+                        agg[i] += p->ts[i];
+                        if (p->ts[i] > 0.0 && bestt > 0.0) { worst[i] = std::max(worst[i], p->ts[i]/bestt); }
+                    }
+                }
+                int robust = 0;
+                for (int i = 1; i < (int)cfgs.size(); ++i) {
+                    if (worst[i] < worst[robust] ||
+                        (worst[i] == worst[robust] && cfgs[i] < cfgs[robust])) { robust = i; }
+                }
+                bool tune = robust != base_i && agg[base_i] / agg[robust] >= TUNE_THETA;
+                bks.push_back({ bK, btok, tune ? robust : base_i, agg, agg[base_i], bp });
+            }
+
+            auto reg_pw = [&](const bkt_t * b, int d) {
+                double r = 0.0;
+                for (const auto * p : b->bp) {
+                    double td = p->ts[d], tT = p->ts[b->Ti];
+                    if (td > 0.0 && tT > 0.0) { r = std::max(r, td/tT - 1.0); }
+                }
+                return r;
+            };
+
+            int bestD = -1, bestRows = 1<<30; double bestTot = 0.0;
+            for (int d = 0; d < (int)cfgs.size(); ++d) {
+                int rows = (d != base_i) ? 1 : 0; double tot = 0.0;
+                for (const auto & _b : bks) {
+                    const bkt_t * b = &_b;
+                    double reg  = reg_pw(b, d);
+                    double slow = b->agg[d] / b->base_agg - 1.0;
+                    if (reg > TUNE_TAU || slow > TUNE_TAU) { rows++; tot += b->agg[b->Ti]; }
+                    else                                   {         tot += b->agg[d];      }
+                }
+                bool better = bestD < 0 || rows < bestRows ||
+                    (rows == bestRows && (tot < bestTot || (tot == bestTot && cfgs[d] < cfgs[bestD])));
+                if (better) { bestD = d; bestRows = rows; bestTot = tot; }
+            }
+            const int dom_id = (dom == 0) ? 0 : 1;
+            if (bestD != base_i) {
+                snprintf(rbuf, sizeof(rbuf),
+                    "    { { GGML_METAL_DEVICE_M4_MAX, %s, -1, %d, {0,0,0,0} }, { %d, %d } },",
+                    mm_tile_dtype_enum_name(dt), dom_id, cfgs[bestD].first, cfgs[bestD].second);
+                rows_out.emplace_back(rbuf);
+            }
+            for (const auto & _b : bks) {
+                const bkt_t * b = &_b;
+                if (reg_pw(b, bestD) <= TUNE_TAU && b->agg[bestD]/b->base_agg - 1.0 <= TUNE_TAU) { continue; }
+                snprintf(rbuf, sizeof(rbuf),
+                    "    { { GGML_METAL_DEVICE_M4_MAX, %s, %d, %d, {0,0,0,0} }, { %d, %d } },",
+                    mm_tile_dtype_enum_name(dt), b->bK, b->btok, cfgs[b->Ti].first, cfgs[b->Ti].second);
+                rows_out.emplace_back(rbuf);
+            }
+        }
+        printf("\n    // ---- %s: %zu rows ----\n", ggml_type_name(dt), rows_out.size());
+        for (const auto & r : rows_out) { printf("%s\n", r.c_str()); }
+    }
+    return true;
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
@@ -9545,6 +9842,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type type_a : all_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
+            }
+        }
+    }
+
+    // [PoC] mul_mm tile go/no-go sweep: m=4032 (=63*64) marks these cases for -p "m=4032".
+    // Run once each under GGML_MM_TILE=base|nr8|nr16 to compare NR1 tiles across dtype x n(=ne11) x K.
+    for (int k : {4096, 14336}) {
+        for (int n : {4, 6, 8, 12, 16, 24, 32, 48}) {
+            for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4032, n, k, {1, 1}, {1, 1}));
             }
         }
     }
@@ -9791,6 +10098,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_from_file(const c
 
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
+    if (mode == MODE_TUNE) {
+        ggml_backend_t backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
+        GGML_ASSERT(backend_cpu != NULL);
+        {
+            using ggml_backend_cpu_set_use_ref_t = void (*)(ggml_backend_t, bool);
+            auto * cpu_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+            auto * set_use_ref = (ggml_backend_cpu_set_use_ref_t) ggml_backend_reg_get_proc_address(
+                cpu_reg, "ggml_backend_cpu_set_use_ref");
+            if (set_use_ref) { set_use_ref(backend_cpu, true); }
+        }
+        const bool ok = g_mm_tune_perf
+            ? run_mm_tile_tune_perf(backend)
+            : run_mm_tile_tune_check(backend, backend_cpu);
+        ggml_backend_free(backend_cpu);
+        return ok;
+    }
+
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
         if (params_filter == nullptr) {
             return;
@@ -9819,6 +10143,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             break;
         case MODE_PERF:
             test_cases = make_test_cases_perf();
+            break;
+        case MODE_TUNE:
+            // unreachable: MODE_TUNE is handled by early return above
             break;
         }
     } else {
@@ -10107,6 +10434,10 @@ int main(int argc, char ** argv) {
             mode = MODE_GRAD;
         } else if (strcmp(argv[i], "support") == 0) {
             mode = MODE_SUPPORT;
+        } else if (strcmp(argv[i], "tune") == 0) {
+            mode = MODE_TUNE;
+        } else if (strcmp(argv[i], "--tune-perf") == 0) {
+            g_mm_tune_perf = true;
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 < argc) {
                 op_names_filter = argv[++i];
