@@ -9410,9 +9410,11 @@ using set_mm_tile_override_t   = void (*)(int16_t, int16_t);
 using clear_mm_tile_override_t = void (*)(void);
 using mm_tile_bucket_t         = int  (*)(int64_t);
 
-// legal (nr0,nr1) pairs for the tile family
+// The tile family (keep in sync with MM_TILE_FAMILY in ggml-metal-tuning.h):
+// 6 instantiated tiles, no 64x32. 64x32 is the baseline, served by the bare
+// kernel_mul_mm and guarded separately by run_mm_tile_drift_guard.
 static std::vector<std::pair<int,int>> mm_tile_legal_configs() {
-    return { {32,8}, {32,16}, {64,8}, {64,16}, {64,32}, {128,16}, {128,32} };
+    return { {32,8}, {32,16}, {64,8}, {64,16}, {128,16}, {128,32} };
 }
 
 // Numerical gate: for each (dtype, K, tokens) point x legal (nr0,nr1), force the
@@ -9426,8 +9428,9 @@ static bool run_mm_tile_tune_check(ggml_backend_t backend_metal, ggml_backend_t 
     const ggml_type dtypes[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16 };
     const int K_pts[]      = { 64, 128, 4096, 4097, 14336 };  // 64/128=minimal, 4097=odd K
     const int tokens_pts[] = { 1, 4, 8, 9, 16, 32, 33 };      // straddle each bucket edge
-    // M fixed at 4032 (=63*64, exercises bc_out path since 4032%128!=0)
-    const int M = 4032;
+    // M=4112 (%32=%64=%128=16): exercises the M-tail (partial-nr0 writeback) for all
+    // three NR0 tiles at once; the token points above cover the N-tail (%nr1 != 0).
+    const int M = 4112;
 
     bool ok = true;
     int n_run = 0, n_fail = 0;
@@ -9451,6 +9454,44 @@ static bool run_mm_tile_tune_check(ggml_backend_t backend_metal, ggml_backend_t 
         }
     }
     printf("mm_tile tune-check: %d cases run, %d failed\n", n_run, n_fail);
+    return ok;
+}
+
+// Baseline drift-guard: the tile family no longer includes 64x32, so tune-check
+// (which iterates mm_tile_legal_configs) never exercises the bare kernel_mul_mm
+// path. Force the baseline cfg (routes to the bare kernel via unified naming) and
+// compare against CPU-ref to keep that path gated.
+static bool run_mm_tile_drift_guard(ggml_backend_t backend_metal, ggml_backend_t backend_cpu) {
+    auto * reg  = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_metal));
+    auto set_ov = (set_mm_tile_override_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_mm_tile_override");
+    auto clr_ov = (clear_mm_tile_override_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_clear_mm_tile_override");
+    if (!set_ov || !clr_ov) { printf("metal mm_tile override proc unavailable\n"); return false; }
+
+    const ggml_type dtypes[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16 };
+    const int K_pts[]      = { 4096, 4097, 14336 };  // 4097 = odd K (bc_inp path)
+    const int tokens_pts[] = { 8, 16, 33 };          // decode + batch, all %32 != 0 (N-tail)
+    const int M = 4112;                              // %64=16 -> baseline M-tail
+
+    bool ok = true;
+    int n_run = 0, n_fail = 0;
+    for (ggml_type dt : dtypes) {
+        for (int K : K_pts) {
+            if (K % ggml_blck_size(dt) != 0) { continue; }
+            for (int tokens : tokens_pts) {
+                set_ov(64, 32);  // -> bare kernel_mul_mm
+                test_mul_mat tc(dt, GGML_TYPE_F32, M, tokens, K, {1,1}, {1,1});
+                auto st = tc.eval(backend_metal, backend_cpu, "MUL_MAT", nullptr);
+                clr_ov();
+                if (st == test_status_t::FAIL) {
+                    printf("FAIL baseline dt=%s M=%d K=%d tokens=%d\n",
+                           ggml_type_name(dt), M, K, tokens);
+                    ok = false; n_fail++;
+                }
+                n_run++;
+            }
+        }
+    }
+    printf("mm_tile drift-guard (baseline 64x32): %d cases run, %d failed\n", n_run, n_fail);
     return ok;
 }
 
@@ -9541,7 +9582,11 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
 
     const double TUNE_TAU   = 0.05;
     const double TUNE_THETA = 1.05;
-    const auto   cfgs = mm_tile_legal_configs();  // {(nr0,nr1), ...}
+    // family members + baseline (64x32) as the comparison anchor; the baseline is
+    // measured via set_override -> bare kernel_mul_mm, so it must be a candidate here
+    // even though it is not a tune-check family member.
+    std::vector<std::pair<int,int>> cfgs = mm_tile_legal_configs();
+    cfgs.push_back({ 64, 32 });
     const int    base_i = [&]() {
         for (int i = 0; i < (int)cfgs.size(); ++i) {
             if (cfgs[i].first == 64 && cfgs[i].second == 32) { return i; }
@@ -10110,7 +10155,12 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         }
         const bool ok = g_mm_tune_perf
             ? run_mm_tile_tune_perf(backend)
-            : run_mm_tile_tune_check(backend, backend_cpu);
+            : [&]() {
+                  // run both under plain `tune`: family numerics + baseline drift-guard
+                  const bool ok_check = run_mm_tile_tune_check(backend, backend_cpu);
+                  const bool ok_drift = run_mm_tile_drift_guard(backend, backend_cpu);
+                  return ok_check && ok_drift;
+              }();
         ggml_backend_free(backend_cpu);
         return ok;
     }

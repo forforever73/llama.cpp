@@ -723,33 +723,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         (tsrc0 == GGML_TYPE_Q4_0 || tsrc0 == GGML_TYPE_Q8_0 ||
          tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_F16);
     const auto * dev_props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
-    ggml_metal_tuning::mm_tile_cfg_t tile_cfg =
-        tile_eligible
+
+    // pick returns a legal cfg: tuned-table rows are static_assert'd legal and the
+    // baseline (64x32) is legal. name/grid/smem are all derived from this one cfg,
+    // so they can never desync (mirrors fa_vec's _q%d_ne%d suffix).
+    const ggml_metal_tuning::mm_tile_cfg_t cfg = tile_eligible
         ? ggml_metal_tuning::mm_tile_pick(
               dev_props->device_id,
-              0,                             // gpu_family: PoC anchors on exact device_id; family fallback unused
               (int) tsrc0,
               (int64_t) op->src[0]->ne[0],   // K
               (int64_t) op->src[1]->ne[1])   // tokens (ne11)
         : ggml_metal_tuning::mm_tile_baseline_cfg();
-    const int mm_nr0 = tile_eligible ? (int) tile_cfg.nr0 : 64;
-    const int mm_nr1 = tile_eligible ? (int) tile_cfg.nr1 : 32;
-    const char * mm_variant = tile_eligible
-        ? ([](int nr0, int nr1) -> const char * {
-               if (nr0 ==  32 && nr1 ==  8) return "_tile_32x8_";
-               if (nr0 ==  32 && nr1 == 16) return "_tile_32x16_";
-               if (nr0 ==  64 && nr1 ==  8) return "_tile_64x8_";
-               if (nr0 ==  64 && nr1 == 16) return "_tile_64x16_";
-               if (nr0 ==  64 && nr1 == 32) return "_tile_64x32_";
-               if (nr0 == 128 && nr1 == 16) return "_tile_128x16_";
-               if (nr0 == 128 && nr1 == 32) return "_tile_128x32_";
-               return "";  // illegal config -> fall through to baseline kernel
-           })(mm_nr0, mm_nr1)
-        : "";
+
+    const int nr0 = cfg.nr0;
+    const int nr1 = cfg.nr1;
 
     const bool bc_out = has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
-        : (op->ne[0] % mm_nr0 != 0 || op->ne[1] % mm_nr1 != 0);
+        : (op->ne[0] % nr0 != 0 || op->ne[1] % nr1 != 0);
 
     GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
     const int16_t ne12 = (int16_t) op->src[1]->ne[2];
@@ -757,13 +748,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    if (tile_eligible && mm_variant[0] != '\0') {
-        snprintf(base, 256, "kernel_mul_mm%s%s_%s",
-                 mm_variant, ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    } else {
-        snprintf(base, 256, "kernel_mul_mm_%s_%s",
-                 ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    // baseline (64x32) -> plain kernel_mul_mm; any other tile appends _tile_{nr0}x{nr1}.
+    char tile_suffix[16] = {0};
+    if (!(nr0 == 64 && nr1 == 32)) {
+        snprintf(tile_suffix, sizeof(tile_suffix), "_tile_%dx%d", nr0, nr1);
     }
+    snprintf(base, 256, "kernel_mul_mm%s_%s_%s", tile_suffix,
+             ggml_type_name(tsrc0), ggml_type_name(tsrc1));
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
 
@@ -786,26 +777,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     if (has_tensor) {
         res.nr0 = NRA;
         res.nr1 = NRB;
+        res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
 
         const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
         res.smem = smem_a;
     } else {
-        res.nr0 = mm_nr0;
-        res.nr1 = mm_nr1;
+        res.nr0 = nr0;
+        res.nr1 = nr1;
+        res.nsg = nr0 / 16;  // 32->2, 64->4, 128->8 (== baseline 4 at nr0=64)
 
         // smem = max(sa+sb, bc_out buffer): the writeback path reuses shmem as a
         // NR0 x NR1 float scratch, which can exceed the sa+sb load buffers for large tiles.
         const size_t NK = 32;
-        const size_t sa = (size_t) mm_nr0 * NK * sizeof(ggml_fp16_t);
-        const size_t sb = (size_t) mm_nr1 * NK * sizeof(ggml_fp16_t);
-        const size_t bc = (size_t) mm_nr0 * mm_nr1 * sizeof(float);
+        const size_t sa = (size_t) nr0 * NK * sizeof(ggml_fp16_t);
+        const size_t sb = (size_t) nr1 * NK * sizeof(ggml_fp16_t);
+        const size_t bc = (size_t) nr0 * nr1 * sizeof(float);
         res.smem = bc_out ? std::max(sa + sb, bc) : (sa + sb);
-    }
-
-    res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
-    if (tile_eligible && mm_variant[0] != '\0') {
-        const int N_SG = (mm_nr0 == 128) ? 8 : (mm_nr0 == 32) ? 2 : 4;
-        res.nsg = N_SG;
     }
 
     return res;

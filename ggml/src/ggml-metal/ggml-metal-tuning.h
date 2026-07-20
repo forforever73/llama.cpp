@@ -21,6 +21,15 @@ struct mm_tile_cfg_t {
     int16_t nr1;  //  8, 16, or  32
 };
 
+// Single source of truth for the instantiated tile variants in mul_mm.metal.
+// Tuned-table rows are static_assert'd to be a family member or the baseline,
+// and run_mm_tile_tune_check exercises every member. 64x32 is NOT a family
+// member; it is the baseline, served by the bare kernel_mul_mm.
+constexpr mm_tile_cfg_t MM_TILE_FAMILY[] = {
+    { 32, 8 }, { 32, 16 }, { 64, 8 }, { 64, 16 }, { 128, 16 }, { 128, 32 },
+};
+constexpr mm_tile_cfg_t MM_TILE_BASELINE_CFG = { 64, 32 };
+
 // Tuned table has two row kinds.
 // Exact rows key a (K_b, tokens_b) bucket.
 // Default rows collapse K over one tokens domain:
@@ -52,7 +61,6 @@ mm_tile_cfg_t  mm_tile_baseline_cfg();
 
 // Returns (64,32) unless a tuned row matches.
 mm_tile_cfg_t  mm_tile_pick(enum ggml_metal_device_id device_id,
-                             int gpu_family,
                              int dtype,
                              int64_t K,
                              int64_t tokens);
