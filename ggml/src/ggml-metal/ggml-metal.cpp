@@ -889,8 +889,14 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     if (strcmp(name, "ggml_backend_metal_mm_tile_K_bucket") == 0) {
         return (void *)(int (*)(int64_t)) ggml_metal_tuning::mm_tile_K_bucket;
     }
+    if (strcmp(name, "ggml_backend_metal_mm_tile_N0_bucket") == 0) {
+        return (void *)(int (*)(int64_t)) ggml_metal_tuning::mm_tile_N0_bucket;
+    }
     if (strcmp(name, "ggml_backend_metal_mm_tile_token_bucket") == 0) {
         return (void *)(int (*)(int64_t)) ggml_metal_tuning::mm_tile_token_bucket;
+    }
+    if (strcmp(name, "ggml_backend_metal_mm_tile_lattice_selftest") == 0) {
+        return (void *)(int (*)(void)) ggml_metal_tuning::mm_tile_lattice_selftest;
     }
     return NULL;
 

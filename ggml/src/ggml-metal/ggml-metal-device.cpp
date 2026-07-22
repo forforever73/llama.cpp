@@ -732,6 +732,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
               dev_props->device_id,
               (int) tsrc0,
               (int64_t) op->src[0]->ne[0],   // K
+              (int64_t) op->src[0]->ne[1],   // N_out (out-feat, ne01)
               (int64_t) op->src[1]->ne[1])   // tokens (ne11)
         : ggml_metal_tuning::mm_tile_baseline_cfg();
 
