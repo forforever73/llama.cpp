@@ -9596,30 +9596,41 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
     // time, so an unsampled shape resolves via the K->N0 collapse lattice.
     const ggml_type dtypes[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16 };
 
-    struct shape_t { int K, N0; bool large; };  // large: sparse token ladder + fewer reps
+    struct shape_t { int K, N0; };
     const shape_t zoo[] = {
         // proj (q/k/v/o): K=hidden, N0=hidden or kv-dim
-        { 1536, 1536, false }, { 3584, 3584, false }, { 4096, 4096, false },
-        { 4096, 1024, false }, { 8192, 8192, false }, { 8192, 1024, false },
+        { 1536, 1536 }, { 3584, 3584 }, { 4096, 4096 }, { 5120, 5120 },
+        { 4096, 1024 }, { 8192, 8192 }, { 8192, 1024 },
         // FFN up (gate/up): K=hidden, N0=intermediate
-        { 4096, 14336, false }, { 3584, 18944, false }, { 8192, 28672, true }, { 5120, 27648, true },
-        // FFN down: K=intermediate, N0=hidden
-        { 14336, 4096, false }, { 18944, 3584, false }, { 28672, 8192, true },
+        { 4096, 14336 }, { 3584, 18944 }, { 8192, 28672 }, { 5120, 27648 },
+        // FFN down: K=intermediate, N0=hidden. 5120/4608 N0 samples the [4608,8192)
+        // bucket so 13B/14B/32B/Gemma-27B down_proj gets measured, not extrapolated.
+        { 14336, 4096 }, { 18944, 3584 }, { 28672, 8192 },
+        { 17408, 5120 }, { 13824, 5120 }, { 36864, 4608 },
         // vocab (lm_head): K=hidden, N0=vocab (huge outlier)
-        { 4096, 128256, true }, { 3584, 152064, true },
+        { 4096, 128256 }, { 3584, 152064 },
         // exotic: DeepSeek-V3 tall-thin kv_b/q_b + Qwen3-MoE expert small-K
-        { 32768, 512, false }, { 24576, 1536, false }, { 2048, 768, false },
+        { 32768, 512 }, { 24576, 1536 }, { 2048, 768 },
     };
     // token ladder: {9..512} + a 2048 validation point (checks winner@2048 ==
     // winner@512 to decide whether the top bucket [256,inf) needs another edge).
     // 96 and 192 give buckets [64,128) and [128,256) >=2 sample points each.
-    // decode (<=8) is excluded (mm path needs ne11>8); large shapes use a sparse
-    // ladder to bound wall-clock.
+    // decode (<=8) is excluded (mm path needs ne11>8). Every shape uses the full
+    // ladder: the low-token crossover (small-tile vs baseline) is where the tuned
+    // rows earn their keep, and it drifts per shape, so it must be sampled for the
+    // large FFN/vocab shapes too, not extrapolated from small shapes.
     const int tokens_full[]   = { 9, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 2048 };
-    const int tokens_sparse[] = { 9, 128, 512, 2048 };
 
     const double TUNE_TAU   = 0.05;
     const double TUNE_THETA = 1.05;
+    // A tile is emitted only if it never loses to baseline by >TUNE_FLOOR at a real
+    // prefill token. Off-ladder tokens (9/24/48/96/192) still feed min-max-regret but
+    // do not authorize a tile: baseline's period-32 tail-waste means a tile can win at
+    // t=48 yet lose at the t=32/64 the runtime visits.
+    const double TUNE_FLOOR = 0.02;
+    auto is_real_token = [](int t) {
+        return t == 16 || t == 32 || t == 64 || t == 128 || t == 256 || t == 512;
+    };
     // family members + baseline (64x32) as the comparison anchor; the baseline is
     // measured via set_override -> bare kernel_mul_mm, so it must be a candidate here
     // even though it is not a tune-check family member.
@@ -9643,9 +9654,9 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
 
         for (const shape_t & sh : zoo) {
             if (sh.K % ggml_blck_size(dt) != 0) { continue; }  // skip K not aligned to the dtype block
-            const int * toks   = sh.large ? tokens_sparse : tokens_full;
-            const int   n_toks = sh.large ? (int)std::size(tokens_sparse) : (int)std::size(tokens_full);
-            const int   reps   = sh.large ? 7 : 11;  // big cells have low variance -> fewer reps
+            const int * toks   = tokens_full;
+            const int   n_toks = (int)std::size(tokens_full);
+            const int   reps   = 11;
             for (int ti = 0; ti < n_toks; ++ti) {
                 const int tokens = toks[ti];
                 mm_perf_cell cell = mm_build_perf_cell(backend_metal, dt, sh.N0, sh.K, tokens);
@@ -9700,6 +9711,7 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
         // (each sampled (K_b,N0_b) can keep its own L1 row) and group_split finds
         // one L2b default cfg (ANY,ANY,tok_b) as the safety net for unsampled
         // (K,N0), plus exact-row exceptions where that default is insufficient.
+        // Both are gated by the real-token floor (TUNE_FLOOR).
         std::vector<std::string> rows_out;
         char rbuf[256];
         std::set<int> token_buckets;
@@ -9741,6 +9753,16 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                         (worst[i] == worst[robust] && cfgs[i] < cfgs[robust])) { robust = i; }
                 }
                 bool tune = robust != base_i && agg[base_i] / agg[robust] >= TUNE_THETA;
+                // real-token floor: drop the tile if it loses to baseline in-cell.
+                if (tune) {
+                    double wr = 0.0;
+                    for (const auto * p : bp) {
+                        if (!is_real_token(p->tokens)) { continue; }
+                        double td = p->ts[robust], tb2 = p->ts[base_i];
+                        if (td > 0.0 && tb2 > 0.0) { wr = std::max(wr, td / tb2); }
+                    }
+                    if (wr > 1.0 + TUNE_FLOOR) { tune = false; }
+                }
                 bks.push_back({ bK, bN0, tune ? robust : base_i, agg, agg[base_i], bp });
             }
 
@@ -9766,6 +9788,19 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                 bool better = bestD < 0 || rows < bestRows ||
                     (rows == bestRows && (tot < bestTot || (tot == bestTot && cfgs[d] < cfgs[bestD])));
                 if (better) { bestD = d; bestRows = rows; bestTot = tot; }
+            }
+            // same floor on the L2b default: it is served to unsampled cells, so it
+            // must not lose to baseline at any real token across the bucket.
+            if (bestD != base_i) {
+                double wr = 0.0;
+                for (const auto & _b : bks) {
+                    for (const auto * p : _b.bp) {
+                        if (!is_real_token(p->tokens)) { continue; }
+                        double td = p->ts[bestD], tb2 = p->ts[base_i];
+                        if (td > 0.0 && tb2 > 0.0) { wr = std::max(wr, td / tb2); }
+                    }
+                }
+                if (wr > 1.0 + TUNE_FLOOR) { bestD = base_i; }
             }
             if (bestD != base_i) {
                 // token-bucket default = L2b (collapse K and N0), exact tokens_b=tb

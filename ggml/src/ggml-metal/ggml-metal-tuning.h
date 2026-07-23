@@ -16,8 +16,10 @@ namespace ggml_metal_tuning {
 // K (in-feat, ne00): 0=<2048, 1=2048-8191, 2=8192-16383, 3=>=16384
 // (edge at 8192 separates the 4096/5120 hidden-dim cluster from large-K FFN/attn)
 constexpr int MM_TILE_K_BUCKETS[]      = { 2048, 8192, 16384 };
-// out-feat (ne01): 0=<2048, 1=2048-8191, 2=8192-29999, 3=>=30000 (vocab isolated)
-constexpr int MM_TILE_N0_BUCKETS[]     = { 2048, 8192, 30000 };
+// out-feat (ne01): 0=<2048, 1=2048-4607, 2=4608-8191, 3=8192-29999, 4=>=30000 (vocab isolated).
+// Edge at 4608 splits the 3584/4096 cluster from 4608/5120: the crossover drifts with N0
+// (baseline threadgroup count -> occupancy), so 5120 must not inherit the 3584/4096 winner.
+constexpr int MM_TILE_N0_BUCKETS[]     = { 2048, 4608, 8192, 30000 };
 // token (ne11): 0=<32, 1=32-63, 2=64-127, 3=128-255, 4=>=256. Split finely across
 // the low-token range: the small-tile vs baseline crossover sits here and drifts
 // per (dtype,K,N0), so each side of it gets its own bucket to key a tuned row.
