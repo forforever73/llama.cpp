@@ -20,10 +20,13 @@ constexpr int MM_TILE_K_BUCKETS[]      = { 2048, 8192, 16384 };
 // Edge at 4608 splits the 3584/4096 cluster from 4608/5120: the crossover drifts with N0
 // (baseline threadgroup count -> occupancy), so 5120 must not inherit the 3584/4096 winner.
 constexpr int MM_TILE_N0_BUCKETS[]     = { 2048, 4608, 8192, 30000 };
-// token (ne11): 0=<32, 1=32-63, 2=64-127, 3=128-255, 4=>=256. Split finely across
-// the low-token range: the small-tile vs baseline crossover sits here and drifts
+// token (ne11): 0=<32, 1=32-63, 2=64-127, 3=>=128. Split finely across the
+// low-token range: the small-tile vs baseline crossover sits here and drifts
 // per (dtype,K,N0), so each side of it gets its own bucket to key a tuned row.
-constexpr int MM_TILE_TOKEN_BUCKETS[]  = { 32, 64, 128, 256 };
+// There is no bucket above 128: mm_tile_pick short-circuits tokens >= 256 to
+// baseline (every tuned device converged to baseline there), so bucket-3 rows
+// effectively serve [128,256). Keep that short-circuit in sync with this edge.
+constexpr int MM_TILE_TOKEN_BUCKETS[]  = { 32, 64, 128 };
 
 int mm_tile_K_bucket(int64_t K);
 int mm_tile_N0_bucket(int64_t N_out);

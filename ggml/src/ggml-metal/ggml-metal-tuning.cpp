@@ -315,7 +315,7 @@ int mm_tile_lattice_selftest() {
     const mm_tile_cfg_t base = mm_tile_baseline_cfg();
 
     auto eq = [](mm_tile_cfg_t a, mm_tile_cfg_t b) { return a.nr0 == b.nr0 && a.nr1 == b.nr1; };
-    // Bucket edges: K_b {2048,8192,16384}, N0_b {2048,4608,8192,30000}, tokens_b {32,64,128,256}.
+    // Bucket edges: K_b {2048,8192,16384}, N0_b {2048,4608,8192,30000}, tokens_b {32,64,128}.
     int fails = 0;
     // L1 hit: K_b=1 (4096), N0_b=1 (4096), tokens_b=1 (48)
     if (!eq(mm_tile_pick_from_table(tbl, n, dev, dt, 4096, 4096, 48), exact_cfg)) { fails++; }
@@ -326,7 +326,7 @@ int mm_tile_lattice_selftest() {
     // all miss -> baseline: tokens_b=0 (8) matches no row
     if (!eq(mm_tile_pick_from_table(tbl, n, dev, dt, 1024,  512,  8), base))      { fails++; }
     // tokens never folds: (K_b=1,N0_b=1) would hit L1 if tokens folded, but
-    // tokens_b=4 (256) matches no row at any level -> baseline
+    // tokens_b=3 (256) matches no row at any level -> baseline
     if (!eq(mm_tile_pick_from_table(tbl, n, dev, dt, 4096, 4096, 256), base))     { fails++; }
     return fails;
 }

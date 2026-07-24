@@ -9612,14 +9612,19 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
         // exotic: DeepSeek-V3 tall-thin kv_b/q_b + Qwen3-MoE expert small-K
         { 32768, 512 }, { 24576, 1536 }, { 2048, 768 },
     };
-    // token ladder: {9..512} + a 2048 validation point (checks winner@2048 ==
-    // winner@512 to decide whether the top bucket [256,inf) needs another edge).
-    // 96 and 192 give buckets [64,128) and [128,256) >=2 sample points each.
+    // token ladder: ends at 192. tokens >= 256 is short-circuited to baseline by
+    // mm_tile_pick (verified all-baseline at 256/512/2048 in the P4/P5 sweeps:
+    // the baseline dispatch saturates the GPU there, so the top bucket never got
+    // a row) — sampling it again each retune would spend most of the sweep's
+    // wall-clock on its most expensive, throttle-prone cells to reconfirm a
+    // short-circuited region. When tuning a NEW device, temporarily re-add
+    // {256, 512} here once to confirm the short-circuit holds before trusting it.
+    // 96 and 192 give buckets [64,128) and [128,inf) >=2 sample points each.
     // decode (<=8) is excluded (mm path needs ne11>8). Every shape uses the full
     // ladder: the low-token crossover (small-tile vs baseline) is where the tuned
     // rows earn their keep, and it drifts per shape, so it must be sampled for the
     // large FFN/vocab shapes too, not extrapolated from small shapes.
-    const int tokens_full[]   = { 9, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 2048 };
+    const int tokens_full[]   = { 9, 16, 24, 32, 48, 64, 96, 128, 192 };
 
     const double TUNE_TAU   = 0.05;
     const double TUNE_THETA = 1.05;
@@ -9629,7 +9634,13 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
     // t=48 yet lose at the t=32/64 the runtime visits.
     const double TUNE_FLOOR = 0.02;
     auto is_real_token = [](int t) {
-        return t == 16 || t == 32 || t == 64 || t == 128 || t == 256 || t == 512;
+        return t == 16 || t == 32 || t == 64 || t == 128;  // real prefill points on the ladder
+    };
+    // occupancy-saturation threshold; keep in sync with MM_TILE_C_SAT_M4_MAX
+    // (ggml-metal-tuning.h). Used only for emit-time sanity reporting below.
+    const int64_t C_SAT = 144;
+    auto n_tg_base = [](int64_t N0, int64_t tokens) {
+        return ((N0 + 63) / 64) * ((tokens + 31) / 32);
     };
     // family members + baseline (64x32) as the comparison anchor; the baseline is
     // measured via set_override -> bare kernel_mul_mm, so it must be a candidate here
@@ -9775,6 +9786,36 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                 return r;
             };
 
+            // emit-time sanity report for a non-baseline row: cross-check the row
+            // against the occupancy rule that backs the runtime veto. Only samples
+            // the veto can fire on count (real token AND t>=32; t<32 is exempt).
+            // A row whose vetoable samples are all saturated is unreachable (the
+            // veto overrides it); a row the rule disputes with >5% measured margin
+            // marks a cell whose winner is extrapolation-fragile, so suggest
+            // adding sibling shapes to the zoo before trusting it.
+            auto sanity_row = [&](const std::vector<const pt_t*> & bp, int d, const char * kind) {
+                if (d == base_i) { return; }
+                int n_vet = 0, n_sat = 0;
+                double worst_sat = 0.0;
+                for (const auto * p : bp) {
+                    if (!is_real_token(p->tokens) || p->tokens < 32) { continue; }
+                    n_vet++;
+                    if (n_tg_base(p->N0, p->tokens) >= C_SAT) {
+                        n_sat++;
+                        double td = p->ts[d], tb2 = p->ts[base_i];
+                        if (td > 0.0 && tb2 > 0.0) { worst_sat = std::max(worst_sat, td/tb2); }
+                    }
+                }
+                if (n_vet > 0 && n_sat == n_vet) {
+                    printf("# SANITY %s row unreachable: all %d vetoable real-token samples sit at"
+                           " n_tg>=%lld, the runtime veto overrides this tile\n", kind, n_vet, (long long)C_SAT);
+                } else if (worst_sat > 1.05) {
+                    printf("# SANITY %s row disputed: tile loses %.0f%% to baseline at a saturated"
+                           " real-token sample; consider adding sibling shapes to the zoo\n",
+                           kind, 100.0*(worst_sat - 1.0));
+                }
+            };
+
             int bestD = -1, bestRows = 1<<30; double bestTot = 0.0;
             for (int d = 0; d < (int)cfgs.size(); ++d) {
                 int rows = (d != base_i) ? 1 : 0; double tot = 0.0;
@@ -9804,6 +9845,9 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
             }
             if (bestD != base_i) {
                 // token-bucket default = L2b (collapse K and N0), exact tokens_b=tb
+                std::vector<const pt_t*> all_bp;
+                for (const auto & _b : bks) { all_bp.insert(all_bp.end(), _b.bp.begin(), _b.bp.end()); }
+                sanity_row(all_bp, bestD, "L2b");
                 snprintf(rbuf, sizeof(rbuf),
                     "    { { GGML_METAL_DEVICE_M4_MAX, %s, -1, -1, %d, {0,0,0} }, { %d, %d } },",
                     mm_tile_dtype_enum_name(dt), tb, cfgs[bestD].first, cfgs[bestD].second);
@@ -9813,6 +9857,7 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                 const bkt_t * b = &_b;
                 if (reg_pw(b, bestD) <= TUNE_TAU && b->agg[bestD]/b->base_agg - 1.0 <= TUNE_TAU) { continue; }
                 // exception = L1 exact bucket: (K_b, N0_b, tokens_b)
+                sanity_row(b->bp, b->Ti, "L1");
                 snprintf(rbuf, sizeof(rbuf),
                     "    { { GGML_METAL_DEVICE_M4_MAX, %s, %d, %d, %d, {0,0,0} }, { %d, %d } },",
                     mm_tile_dtype_enum_name(dt), b->bK, b->bN0, tb, cfgs[b->Ti].first, cfgs[b->Ti].second);
