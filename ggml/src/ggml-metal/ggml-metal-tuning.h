@@ -44,6 +44,20 @@ constexpr mm_tile_cfg_t MM_TILE_FAMILY[] = {
 };
 constexpr mm_tile_cfg_t MM_TILE_BASELINE_CFG = { 64, 32 };
 
+// Occupancy-saturation threshold for the pick-time veto, measured in baseline
+// (64x32) threadgroup count: n_tg = ceil(N_out/64) * ceil(tokens/32). Once the
+// baseline dispatch alone saturates the GPU (n_tg >= C_sat), a smaller tile has
+// no occupancy headroom left to win, so any non-baseline table row is overridden
+// back to baseline. This bounds table extrapolation error on shapes the sweep
+// never sampled. tokens < 32 is exempt: those wins come from baseline's token
+// padding + bc_out slow path, which persist at any occupancy.
+// Calibrated on M4 Max (40 cores x ~3.6 concurrent tg/core; accuracy is flat
+// for C_sat in [128,160]). Per-device data like the tuned table: recalibrate
+// when adding rows for a new device. Overestimating C_sat degrades to pure
+// table behavior; underestimating only forfeits small-tile wins - neither
+// direction can pick something slower than baseline.
+constexpr int MM_TILE_C_SAT_M4_MAX = 144;
+
 // Tuned table has two row kinds.
 // Exact rows key a (K_b, N0_b, tokens_b) bucket.
 // Default rows collapse the high-order dims but ALWAYS keep tokens_b, per the

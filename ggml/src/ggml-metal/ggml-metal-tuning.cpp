@@ -273,8 +273,28 @@ mm_tile_cfg_t mm_tile_pick(enum ggml_metal_device_id device_id,
                             int64_t N_out,
                             int64_t tokens) {
     if (g_mm_override_set) { return g_mm_override_cfg; }
-    return mm_tile_pick_from_table(mm_tile_tuned_table, std::size(mm_tile_tuned_table),
-                                   device_id, dtype, K, N_out, tokens);
+
+    // Large-batch short-circuit: every tuned device converged to baseline for
+    // tokens >= 256 (the top token bucket has no rows by design), and at these
+    // sizes the baseline dispatch always saturates the GPU. Skip the scan.
+    if (tokens >= 256) { return mm_tile_baseline_cfg(); }
+
+    const mm_tile_cfg_t cfg = mm_tile_pick_from_table(mm_tile_tuned_table, std::size(mm_tile_tuned_table),
+                                                      device_id, dtype, K, N_out, tokens);
+
+    // Occupancy veto (see MM_TILE_C_SAT_M4_MAX): if the baseline dispatch
+    // already saturates the GPU, a smaller tile cannot win, so override any
+    // small-tile row back to baseline. Guards against table extrapolation on
+    // unsampled shapes. tokens < 32 wins are padding-driven, not occupancy
+    // -driven, and stay exempt.
+    if (tokens >= 32 &&
+        (cfg.nr0 != MM_TILE_BASELINE_CFG.nr0 || cfg.nr1 != MM_TILE_BASELINE_CFG.nr1)) {
+        const int64_t n_tg = ((N_out + 63) / 64) * ((tokens + 31) / 32);
+        if (n_tg >= MM_TILE_C_SAT_M4_MAX) {
+            return mm_tile_baseline_cfg();
+        }
+    }
+    return cfg;
 }
 
 int mm_tile_lattice_selftest() {
