@@ -9418,16 +9418,16 @@ static std::vector<std::pair<int,int>> mm_tile_legal_configs() {
     return { {32,8}, {32,16}, {64,8}, {64,16}, {128,16}, {128,32} };
 }
 
-// Structural gate for the pick lattice (L1 exact -> L2a K-collapse keeping N0 ->
-// L2b K+N0 collapse -> L3 baseline). The backend runs the real lookup against a
-// synthetic table and reports the failed-assertion count; a broken collapse or a
-// mis-ordered key field is caught here without needing tuned rows on disk.
+// Structural gate for the pick lattice (L1 exact -> L2 N0-collapse -> L3
+// baseline). The backend runs the real lookup against a synthetic table and
+// reports the failed-assertion count; a broken collapse or a mis-ordered key
+// field is caught here without needing tuned rows on disk.
 static bool run_mm_tile_lattice_check(ggml_backend_t backend_metal) {
     auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_metal));
     auto selftest = (mm_tile_selftest_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_mm_tile_lattice_selftest");
     if (!selftest) { printf("metal mm_tile lattice selftest proc unavailable\n"); return false; }
     const int n_fail = selftest();
-    printf("mm_tile lattice-check (L1/L2a/L2b/L3): %d failed\n", n_fail);
+    printf("mm_tile lattice-check (L1/L2/L3): %d failed\n", n_fail);
     return n_fail == 0;
 }
 
@@ -9580,10 +9580,9 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
     auto * reg  = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_metal));
     auto set_ov = (set_mm_tile_override_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_mm_tile_override");
     auto clr_ov = (clear_mm_tile_override_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_clear_mm_tile_override");
-    auto K_bkt  = (mm_tile_bucket_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_mm_tile_K_bucket");
     auto N0_bkt = (mm_tile_bucket_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_mm_tile_N0_bucket");
     auto tok_bkt= (mm_tile_bucket_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_mm_tile_token_bucket");
-    if (!set_ov || !clr_ov || !K_bkt || !N0_bkt || !tok_bkt) {
+    if (!set_ov || !clr_ov || !N0_bkt || !tok_bkt) {
         printf("metal mm_tile tuning procs unavailable\n");
         return false;
     }
@@ -9592,8 +9591,9 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
     // against a token ladder. (K, N0) is sampled in PAIRS (not a cartesian grid)
     // because real weights only occupy a few diagonals of the (K, N0) plane
     // (proj / FFN-up / FFN-down / vocab); the off-diagonal cells are physically
-    // absent shapes. The table still buckets all three dims independently at pick
-    // time, so an unsampled shape resolves via the K->N0 collapse lattice.
+    // absent shapes. K is not a table key (it scales all candidates equally and
+    // never flips the ranking), but deep-K shapes stay in the zoo so the N0/token
+    // aggregation sees their measurements instead of extrapolating.
     const ggml_type dtypes[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16 };
 
     struct shape_t { int K, N0; };
@@ -9601,8 +9601,11 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
         // proj (q/k/v/o): K=hidden, N0=hidden or kv-dim
         { 1536, 1536 }, { 3584, 3584 }, { 4096, 4096 }, { 5120, 5120 },
         { 4096, 1024 }, { 8192, 8192 }, { 8192, 1024 },
-        // FFN up (gate/up): K=hidden, N0=intermediate
+        // FFN up (gate/up): K=hidden, N0=intermediate. 2048/8192 samples the
+        // shallow-K side of the [8192,30000) N0 bucket (1B/3B-class gate/up);
+        // without it that bucket's aggregate is deep-K FFN-down only.
         { 4096, 14336 }, { 3584, 18944 }, { 8192, 28672 }, { 5120, 27648 },
+        { 2048, 8192 },
         // FFN down: K=intermediate, N0=hidden. 5120/4608 N0 samples the [4608,8192)
         // bucket so 13B/14B/32B/Gemma-27B down_proj gets measured, not extrapolated.
         { 14336, 4096 }, { 18944, 3584 }, { 28672, 8192 },
@@ -9718,11 +9721,13 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
         }
 
         // group_split: tokens is the strongest signal and never folds, so each
-        // token bucket is its own group. Within a token bucket, K/N0 stay exact
-        // (each sampled (K_b,N0_b) can keep its own L1 row) and group_split finds
-        // one L2b default cfg (ANY,ANY,tok_b) as the safety net for unsampled
-        // (K,N0), plus exact-row exceptions where that default is insufficient.
-        // Both are gated by the real-token floor (TUNE_FLOOR).
+        // token bucket is its own group. Within a token bucket, points aggregate
+        // per N0 bucket ACROSS K (K never flips the tile ranking, and keying on
+        // it lets exact rows memorize deep-K quirks that misroute unsampled
+        // neighbors); group_split finds one L2 default cfg (ANY,tok_b) as the
+        // safety net for unsampled N0, plus exact-row exceptions where that
+        // default is insufficient. Both are gated by the real-token floor
+        // (TUNE_FLOOR).
         std::vector<std::string> rows_out;
         char rbuf[256];
         std::set<int> token_buckets;
@@ -9734,18 +9739,17 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
             }
             if (db.empty()) { continue; }
 
-            // per-(K_b, N0_b) aggregates within this token bucket
-            std::set<std::pair<int,int>> seen;
-            for (const auto * p : db) { seen.insert({ K_bkt(p->K), N0_bkt(p->N0) }); }
+            // per-N0_b aggregates within this token bucket
+            std::set<int> seen;
+            for (const auto * p : db) { seen.insert(N0_bkt(p->N0)); }
 
-            struct bkt_t { int bK, bN0; int Ti; std::vector<double> agg; double base_agg;
+            struct bkt_t { int bN0; int Ti; std::vector<double> agg; double base_agg;
                            std::vector<const pt_t*> bp; };
             std::vector<bkt_t> bks;
-            for (const auto & bb : seen) {
-                int bK = bb.first, bN0 = bb.second;
+            for (int bN0 : seen) {
                 std::vector<const pt_t*> bp;
                 for (const auto * p : db) {
-                    if (K_bkt(p->K) == bK && N0_bkt(p->N0) == bN0) { bp.push_back(p); }
+                    if (N0_bkt(p->N0) == bN0) { bp.push_back(p); }
                 }
                 std::vector<double> agg(cfgs.size(), 0.0), worst(cfgs.size(), 0.0);
                 for (const auto * p : bp) {
@@ -9774,7 +9778,7 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                     }
                     if (wr > 1.0 + TUNE_FLOOR) { tune = false; }
                 }
-                bks.push_back({ bK, bN0, tune ? robust : base_i, agg, agg[base_i], bp });
+                bks.push_back({ bN0, tune ? robust : base_i, agg, agg[base_i], bp });
             }
 
             auto reg_pw = [&](const bkt_t * b, int d) {
@@ -9830,7 +9834,7 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                     (rows == bestRows && (tot < bestTot || (tot == bestTot && cfgs[d] < cfgs[bestD])));
                 if (better) { bestD = d; bestRows = rows; bestTot = tot; }
             }
-            // same floor on the L2b default: it is served to unsampled cells, so it
+            // same floor on the L2 default: it is served to unsampled cells, so it
             // must not lose to baseline at any real token across the bucket.
             if (bestD != base_i) {
                 double wr = 0.0;
@@ -9844,23 +9848,23 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                 if (wr > 1.0 + TUNE_FLOOR) { bestD = base_i; }
             }
             if (bestD != base_i) {
-                // token-bucket default = L2b (collapse K and N0), exact tokens_b=tb
+                // token-bucket default = L2 (collapse N0), exact tokens_b=tb
                 std::vector<const pt_t*> all_bp;
                 for (const auto & _b : bks) { all_bp.insert(all_bp.end(), _b.bp.begin(), _b.bp.end()); }
-                sanity_row(all_bp, bestD, "L2b");
+                sanity_row(all_bp, bestD, "L2");
                 snprintf(rbuf, sizeof(rbuf),
-                    "    { { GGML_METAL_DEVICE_M4_MAX, %s, -1, -1, %d, {0,0,0} }, { %d, %d } },",
+                    "    { { GGML_METAL_DEVICE_M4_MAX, %s, -1, %d, {0,0,0,0} }, { %d, %d } },",
                     mm_tile_dtype_enum_name(dt), tb, cfgs[bestD].first, cfgs[bestD].second);
                 rows_out.emplace_back(rbuf);
             }
             for (const auto & _b : bks) {
                 const bkt_t * b = &_b;
                 if (reg_pw(b, bestD) <= TUNE_TAU && b->agg[bestD]/b->base_agg - 1.0 <= TUNE_TAU) { continue; }
-                // exception = L1 exact bucket: (K_b, N0_b, tokens_b)
+                // exception = L1 exact bucket: (N0_b, tokens_b)
                 sanity_row(b->bp, b->Ti, "L1");
                 snprintf(rbuf, sizeof(rbuf),
-                    "    { { GGML_METAL_DEVICE_M4_MAX, %s, %d, %d, %d, {0,0,0} }, { %d, %d } },",
-                    mm_tile_dtype_enum_name(dt), b->bK, b->bN0, tb, cfgs[b->Ti].first, cfgs[b->Ti].second);
+                    "    { { GGML_METAL_DEVICE_M4_MAX, %s, %d, %d, {0,0,0,0} }, { %d, %d } },",
+                    mm_tile_dtype_enum_name(dt), b->bN0, tb, cfgs[b->Ti].first, cfgs[b->Ti].second);
                 rows_out.emplace_back(rbuf);
             }
         }

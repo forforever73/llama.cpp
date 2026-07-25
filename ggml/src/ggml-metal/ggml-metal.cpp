@@ -886,9 +886,6 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     if (strcmp(name, "ggml_backend_metal_clear_mm_tile_override") == 0) {
         return (void *) ggml_backend_metal_clear_mm_tile_override_impl;
     }
-    if (strcmp(name, "ggml_backend_metal_mm_tile_K_bucket") == 0) {
-        return (void *)(int (*)(int64_t)) ggml_metal_tuning::mm_tile_K_bucket;
-    }
     if (strcmp(name, "ggml_backend_metal_mm_tile_N0_bucket") == 0) {
         return (void *)(int (*)(int64_t)) ggml_metal_tuning::mm_tile_N0_bucket;
     }
