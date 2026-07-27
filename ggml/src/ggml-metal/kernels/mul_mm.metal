@@ -961,8 +961,10 @@ template [[host_name("kernel_mul_mm_iq4_nl_f16")]]  kernel mul_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_iq4_xs_f16")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
 
 #ifndef GGML_METAL_HAS_TENSOR
-// [autotune] tile family — 6 instantiated tiles (no 64x32: the baseline is served
+// [autotune] tile family — 4 instantiated tiles (no 64x32: the baseline is served
 // by the bare kernel_mul_mm) x {q4_0,q8_0,q4_K,f16} x f32.
+// 128x16/128x32 were instantiated during tuning but no tuned row on any device
+// picked them; re-add here and in MM_TILE_FAMILY when retuning a new device.
 // Keep in sync with MM_TILE_FAMILY; run_mm_tile_tune_check exercises every member.
 // The typedef only names the (NR0/NR1-independent) kernel function type.
 typedef decltype(kernel_mul_mm_tile<
@@ -981,32 +983,24 @@ INST_MM_TILE(32,   8, block_q4_0, 2,     dequantize_q4_0, float, float4x4, float
 INST_MM_TILE(32,  16, block_q4_0, 2,     dequantize_q4_0, float, float4x4, float, float2x4, "q4_0_f32")
 INST_MM_TILE(64,   8, block_q4_0, 2,     dequantize_q4_0, float, float4x4, float, float2x4, "q4_0_f32")
 INST_MM_TILE(64,  16, block_q4_0, 2,     dequantize_q4_0, float, float4x4, float, float2x4, "q4_0_f32")
-INST_MM_TILE(128, 16, block_q4_0, 2,     dequantize_q4_0, float, float4x4, float, float2x4, "q4_0_f32")
-INST_MM_TILE(128, 32, block_q4_0, 2,     dequantize_q4_0, float, float4x4, float, float2x4, "q4_0_f32")
 
 // q8_0 x f32
 INST_MM_TILE(32,   8, block_q8_0, 2,     dequantize_q8_0, float, float4x4, float, float2x4, "q8_0_f32")
 INST_MM_TILE(32,  16, block_q8_0, 2,     dequantize_q8_0, float, float4x4, float, float2x4, "q8_0_f32")
 INST_MM_TILE(64,   8, block_q8_0, 2,     dequantize_q8_0, float, float4x4, float, float2x4, "q8_0_f32")
 INST_MM_TILE(64,  16, block_q8_0, 2,     dequantize_q8_0, float, float4x4, float, float2x4, "q8_0_f32")
-INST_MM_TILE(128, 16, block_q8_0, 2,     dequantize_q8_0, float, float4x4, float, float2x4, "q8_0_f32")
-INST_MM_TILE(128, 32, block_q8_0, 2,     dequantize_q8_0, float, float4x4, float, float2x4, "q8_0_f32")
 
 // q4_K x f32
 INST_MM_TILE(32,   8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4, "q4_K_f32")
 INST_MM_TILE(32,  16, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4, "q4_K_f32")
 INST_MM_TILE(64,   8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4, "q4_K_f32")
 INST_MM_TILE(64,  16, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4, "q4_K_f32")
-INST_MM_TILE(128, 16, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4, "q4_K_f32")
-INST_MM_TILE(128, 32, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4, "q4_K_f32")
 
 // f16 x f32
 INST_MM_TILE(32,   8, half4x4, 1, dequantize_f16, half, half4x4, float, float2x4, "f16_f32")
 INST_MM_TILE(32,  16, half4x4, 1, dequantize_f16, half, half4x4, float, float2x4, "f16_f32")
 INST_MM_TILE(64,   8, half4x4, 1, dequantize_f16, half, half4x4, float, float2x4, "f16_f32")
 INST_MM_TILE(64,  16, half4x4, 1, dequantize_f16, half, half4x4, float, float2x4, "f16_f32")
-INST_MM_TILE(128, 16, half4x4, 1, dequantize_f16, half, half4x4, float, float2x4, "f16_f32")
-INST_MM_TILE(128, 32, half4x4, 1, dequantize_f16, half, half4x4, float, float2x4, "f16_f32")
 
 #undef INST_MM_TILE
 #endif // !GGML_METAL_HAS_TENSOR

@@ -9412,10 +9412,10 @@ using mm_tile_bucket_t         = int  (*)(int64_t);
 using mm_tile_selftest_t       = int  (*)(void);
 
 // The tile family (keep in sync with MM_TILE_FAMILY in ggml-metal-tuning.h):
-// 6 instantiated tiles, no 64x32. 64x32 is the baseline, served by the bare
+// 4 instantiated tiles, no 64x32. 64x32 is the baseline, served by the bare
 // kernel_mul_mm and guarded separately by run_mm_tile_drift_guard.
 static std::vector<std::pair<int,int>> mm_tile_legal_configs() {
-    return { {32,8}, {32,16}, {64,8}, {64,16}, {128,16}, {128,32} };
+    return { {32,8}, {32,16}, {64,8}, {64,16} };
 }
 
 // Structural gate for the pick lattice (L1 exact -> L2 N0-collapse -> L3
@@ -9767,7 +9767,21 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                     if (worst[i] < worst[robust] ||
                         (worst[i] == worst[robust] && cfgs[i] < cfgs[robust])) { robust = i; }
                 }
-                bool tune = robust != base_i && agg[base_i] / agg[robust] >= TUNE_THETA;
+                // theta gate on the per-point geomean of base/robust, not the ratio
+                // of absolute-time sums: the runtime serves each shape independently,
+                // so every sampled point gets equal weight. Summed time lets a few
+                // ~ms deep-K cells outvote consistent wins on ~100us cells, silently
+                // burying e.g. shallow-K gate/up wins in mixed-K buckets.
+                double theta = 0.0;
+                {
+                    double lsum = 0.0; int ln = 0;
+                    for (const auto * p : bp) {
+                        double tb2 = p->ts[base_i], tr = p->ts[robust];
+                        if (tb2 > 0.0 && tr > 0.0) { lsum += std::log(tb2 / tr); ln++; }
+                    }
+                    if (ln > 0) { theta = std::exp(lsum / ln); }
+                }
+                bool tune = robust != base_i && theta >= TUNE_THETA;
                 // real-token floor: drop the tile if it loses to baseline in-cell.
                 if (tune) {
                     double wr = 0.0;

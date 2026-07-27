@@ -43,8 +43,11 @@ struct mm_tile_cfg_t {
 // Tuned-table rows are static_assert'd to be a family member or the baseline,
 // and run_mm_tile_tune_check exercises every member. 64x32 is NOT a family
 // member; it is the baseline, served by the bare kernel_mul_mm.
+// 128x16/128x32 were instantiated during tuning but no tuned row on any device
+// picked them (metallib/compile-time dead weight); re-add here, in
+// mul_mm.metal, and in mm_tile_legal_configs when retuning a new device.
 constexpr mm_tile_cfg_t MM_TILE_FAMILY[] = {
-    { 32, 8 }, { 32, 16 }, { 64, 8 }, { 64, 16 }, { 128, 16 }, { 128, 32 },
+    { 32, 8 }, { 32, 16 }, { 64, 8 }, { 64, 16 },
 };
 constexpr mm_tile_cfg_t MM_TILE_BASELINE_CFG = { 64, 32 };
 
