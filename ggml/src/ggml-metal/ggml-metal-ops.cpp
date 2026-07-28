@@ -7,6 +7,7 @@
 #include "ggml-metal-impl.h"
 #include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
+#include "ggml-metal-tuning.h"
 
 #include <cassert>
 #include <algorithm>
@@ -2064,8 +2065,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     const int16_t r3 = ne13/ne03;
 
     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
-    // to the matrix-vector kernel
-    const int ne11_mm_min = 8;
+    // to the matrix-vector kernel (per-device/dtype/N0; defaults to 8 = upstream)
+    const int ne11_mm_min = ggml_metal_tuning::mm_tile_ne11_mm_min(
+        props_dev->device_id, (int) op->src[0]->type, (int64_t) op->src[0]->ne[1]);
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
@@ -2084,7 +2086,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q8_0 ||
            op->src[0]->type == GGML_TYPE_MXFP4 ||
            op->src[0]->type == GGML_TYPE_IQ4_NL ||
-           false) && (ne11 >= 2 && ne11 <= 8)
+           false) && (ne11 >= 2 && ne11 <= ne11_mm_min)
          ) ||
          (
           (
@@ -2093,7 +2095,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q6_K ||
            op->src[0]->type == GGML_TYPE_Q2_K ||
            op->src[0]->type == GGML_TYPE_Q3_K ||
-           false) && (ne11 >= 4 && ne11 <= 8)
+           false) && (ne11 >= 4 && ne11 <= ne11_mm_min)
          )
         )
        ) {

@@ -101,6 +101,20 @@ mm_tile_cfg_t  mm_tile_pick(enum ggml_metal_device_id device_id,
                              int64_t N_out,
                              int64_t tokens);
 
+// Default mv-ext -> mm break-even: ne11 > this uses mm, ne11 in [.,8] uses mv_ext.
+constexpr int MM_TILE_NE11_MM_MIN_DEFAULT = 8;
+
+// Per-device/(dtype, N0-bucket) break-even: the small-batch mm tile can beat mv_ext
+// below 8, but only at large N0 (small N0 lacks the occupancy for mm), so it is
+// keyed on N0 bucket. Returns MM_TILE_NE11_MM_MIN_DEFAULT (untuned -> upstream
+// dispatch), clamped to it (may only lower the boundary; ne11>8 in mv_ext aborts).
+// Exact device only, like the t>=32 tile rows (crossover scales with core count).
+int            mm_tile_ne11_mm_min(enum ggml_metal_device_id device_id, int dtype, int64_t N_out);
+
+// tune-only override for mm_tile_ne11_mm_min; -1 clears it (forces the mm path so
+// the sweep can measure mm-tile vs mv_ext in the [2,8] range).
+void           mm_tile_set_ne11_mm_min_override(int ne11_mm_min);
+
 // Self-test for the pick lattice (L1 exact -> L2 N0-collapse -> L3 baseline).
 // Runs the real lookup against a synthetic table; returns the number of failed
 // assertions (0 = pass). Wired into `tune`.

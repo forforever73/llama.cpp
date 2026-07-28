@@ -9410,6 +9410,7 @@ using set_mm_tile_override_t   = void (*)(int16_t, int16_t);
 using clear_mm_tile_override_t = void (*)(void);
 using mm_tile_bucket_t         = int  (*)(int64_t);
 using mm_tile_selftest_t       = int  (*)(void);
+using set_ne11_mm_min_t        = void (*)(int);
 
 // The tile family (keep in sync with MM_TILE_FAMILY in ggml-metal-tuning.h):
 // 4 instantiated tiles, no 64x32. 64x32 is the baseline, served by the bare
@@ -9437,15 +9438,19 @@ static bool run_mm_tile_tune_check(ggml_backend_t backend_metal, ggml_backend_t 
     auto * reg  = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_metal));
     auto set_ov = (set_mm_tile_override_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_mm_tile_override");
     auto clr_ov = (clear_mm_tile_override_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_clear_mm_tile_override");
-    if (!set_ov || !clr_ov) { printf("metal mm_tile override proc unavailable\n"); return false; }
+    auto set_sw = (set_ne11_mm_min_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_mm_tile_ne11_mm_min_override");
+    if (!set_ov || !clr_ov || !set_sw) { printf("metal mm_tile override proc unavailable\n"); return false; }
 
     const ggml_type dtypes[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16 };
     const int K_pts[]      = { 64, 128, 4096, 4097, 14336 };  // 64/128=minimal, 4097=odd K
-    const int tokens_pts[] = { 1, 4, 8, 9, 16, 32, 33 };      // straddle each bucket edge
+    // tokens straddle each bucket edge and cover [2,8] (routed into mm by a lowered
+    // switch point); set_sw(1) below forces the mm path so the tile is exercised there.
+    const int tokens_pts[] = { 1, 2, 4, 5, 8, 9, 16, 32, 33 };
     // M=4112 (%32=%64=%128=16): exercises the M-tail (partial-nr0 writeback) for all
     // three NR0 tiles at once; the token points above cover the N-tail (%nr1 != 0).
     const int M = 4112;
 
+    set_sw(1);  // route every ne11>=2 into mm so the tile override actually runs
     bool ok = true;
     int n_run = 0, n_fail = 0;
     for (ggml_type dt : dtypes) {
@@ -9467,6 +9472,7 @@ static bool run_mm_tile_tune_check(ggml_backend_t backend_metal, ggml_backend_t 
             }
         }
     }
+    set_sw(-1);  // restore the per-dtype switch-point table
     printf("mm_tile tune-check: %d cases run, %d failed\n", n_run, n_fail);
     return ok;
 }
@@ -9582,7 +9588,8 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
     auto clr_ov = (clear_mm_tile_override_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_clear_mm_tile_override");
     auto N0_bkt = (mm_tile_bucket_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_mm_tile_N0_bucket");
     auto tok_bkt= (mm_tile_bucket_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_mm_tile_token_bucket");
-    if (!set_ov || !clr_ov || !N0_bkt || !tok_bkt) {
+    auto set_sw = (set_ne11_mm_min_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_mm_tile_ne11_mm_min_override");
+    if (!set_ov || !clr_ov || !N0_bkt || !tok_bkt || !set_sw) {
         printf("metal mm_tile tuning procs unavailable\n");
         return false;
     }
@@ -9622,26 +9629,32 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
     // wall-clock on its most expensive, throttle-prone cells to reconfirm a
     // short-circuited region. When tuning a NEW device, temporarily re-add
     // {256, 512} here once to confirm the short-circuit holds before trusting it.
-    // 96 and 192 give buckets [64,128) and [128,inf) >=2 sample points each.
-    // decode (<=8) is excluded (mm path needs ne11>8). Every shape uses the full
-    // ladder: the low-token crossover (small-tile vs baseline) is where the tuned
-    // rows earn their keep, and it drifts per shape, so it must be sampled for the
-    // large FFN/vocab shapes too, not extrapolated from small shapes.
-    const int tokens_full[]   = { 9, 16, 24, 32, 48, 64, 96, 128, 192 };
+    // 96 and 192 give buckets [64,128) and [128,inf) >=2 sample points each. The low
+    // end [2,8] is the mv_ext->mm crossover zone (measured with the mm path forced,
+    // see set_sw below); it feeds only the switch point, not the tile table.
+    const int tokens_full[]   = { 2, 3, 4, 5, 6, 7, 8, 9, 16, 24, 32, 48, 64, 96, 128, 192 };
 
     const double TUNE_TAU   = 0.05;
     const double TUNE_THETA = 1.05;
     // A tile is emitted only if it never loses to baseline by >TUNE_FLOOR at a real
     // prefill token. Off-ladder tokens (9/24/48/96/192) still feed min-max-regret but
     // do not authorize a tile: baseline's period-32 tail-waste means a tile can win at
-    // t=48 yet lose at the t=32/64 the runtime visits.
+    // t=48 yet lose at the t=32/64 the runtime visits. [2,8] does not feed the tile
+    // table (E6 keeps the P9 tiles); it only measures the mv_ext->mm crossover below.
     const double TUNE_FLOOR = 0.02;
+    // Conservative margin for the routing decision: route a small batch into mm only if
+    // the tok0 tile beats mv_ext by this much at every shape (a near-tie stays mv_ext).
+    const double TUNE_SWITCH_MARGIN = 0.05;
     auto is_real_token = [](int t) {
         return t == 16 || t == 32 || t == 64 || t == 128;  // real prefill points on the ladder
     };
     // occupancy-saturation threshold; keep in sync with MM_TILE_C_SAT_M4_MAX
     // (ggml-metal-tuning.h). Used only for emit-time sanity reporting below.
     const int64_t C_SAT = 144;
+    // upstream mv_ext->mm break-even default; keep in sync with
+    // NE11_MM_MIN_DEFAULT (ggml-metal-tuning.h). The switch-point sweep
+    // scans t in [2, NE11_MM_MIN_DEFAULT] for the per-dtype crossover.
+    const int NE11_MM_MIN_DEFAULT = 8;
     auto n_tg_base = [](int64_t N0, int64_t tokens) {
         return ((N0 + 63) / 64) * ((tokens + 31) / 32);
     };
@@ -9659,11 +9672,25 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
 
     printf("# mm_tile perf sweep — replace GGML_METAL_DEVICE_M4_MAX with this machine's device\n");
     printf("# Format: nr0xnr1=time_us* (* = winner); => cfg NR0xNR1 beats baseline, else => baseline\n");
+    printf("# mv_ext=time_us shown for t<=8 (mm-vs-mv_ext crossover for the per-dtype switch point)\n");
+
+    // Upstream routes ne11 in [2,8] to mul_mv_ext (q4_K: [4,8]), above that to mm. The
+    // sweep forces the mm path (set_sw(1)) to time the tile at t<=8 and the upstream
+    // bound (set_sw(8)) to time mv_ext; mv_ext is a routing rival, not a tile, so it is
+    // kept out of the tile group_split and only feeds the switch-point analysis. Only
+    // classifies K vs non-K; the sweep dtypes all pass the real mv_ext dtype allowlist
+    // (mirror it here if the dtype list grows, else "mv_ext time" would be mul_mv).
+    auto mv_ext_applies = [](ggml_type dt, int t) {
+        if (t < 2 || t > 8) { return false; }              // mv_ext range + abort guard (ne11>8)
+        const bool k_series = (dt == GGML_TYPE_Q4_K || dt == GGML_TYPE_Q5_K ||
+                               dt == GGML_TYPE_Q6_K || dt == GGML_TYPE_Q2_K || dt == GGML_TYPE_Q3_K);
+        return k_series ? (t >= 4) : true;                 // K-series mv_ext starts at 4
+    };
 
     for (ggml_type dt : dtypes) {
         printf("\n### dtype=%s\n", ggml_type_name(dt));
 
-        struct pt_t { int K, N0, tokens; std::vector<double> ts; double base_t; };
+        struct pt_t { int K, N0, tokens; std::vector<double> ts; double base_t; double mv_ext_t; };
         std::vector<pt_t> pts;
 
         for (const shape_t & sh : zoo) {
@@ -9676,6 +9703,7 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                 mm_perf_cell cell = mm_build_perf_cell(backend_metal, dt, sh.N0, sh.K, tokens);
                 if (!cell.ok) { continue; }
 
+                set_sw(1);  // force the mm path so the tile candidates run at t<=8 too
                 std::vector<double> ts(cfgs.size(), 0.0);
                 std::vector<int> order(cfgs.size());
                 std::iota(order.begin(), order.end(), 0);
@@ -9703,6 +9731,15 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                     }
                 }
 
+                // mv_ext rival for the small-batch range: force the upstream switch
+                // point so the dispatch selects mul_mv_ext, then time the same cell.
+                double mv_ext_t = -1.0;
+                if (mv_ext_applies(dt, tokens)) {
+                    set_sw(8);
+                    mv_ext_t = time_mm_cell_median(backend_metal, cell, reps);
+                }
+                set_sw(-1);  // restore the per-dtype table between cells
+
                 int best = 0;
                 for (int i = 1; i < (int)cfgs.size(); ++i) {
                     if (ts[i] > 0.0 && (ts[best] <= 0.0 || ts[i] < ts[best])) { best = i; }
@@ -9713,10 +9750,14 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                     printf("  %dx%d=%.1f%s", cfgs[i].first, cfgs[i].second, ts[i],
                            (i == best) ? "*" : "");
                 }
+                if (mv_ext_t > 0.0) {
+                    printf("  mv_ext=%.1f", mv_ext_t);
+                    if (ts[best] > 0.0) { printf(" (mm %.2fx mv_ext)", mv_ext_t/ts[best]); }
+                }
                 const bool keep = ts[best] > 0.0 && base_t > 0.0 && ts[best] < base_t * 0.98;
                 if (keep) { printf("  => %dx%d  %.2fx\n", cfgs[best].first, cfgs[best].second, base_t/ts[best]); }
                 else      { printf("  => baseline\n"); }
-                pts.push_back({ sh.K, sh.N0, tokens, ts, base_t });
+                pts.push_back({ sh.K, sh.N0, tokens, ts, base_t, mv_ext_t });
             }
         }
 
@@ -9727,15 +9768,19 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
         // neighbors); group_split finds one L2 default cfg (ANY,tok_b) as the
         // safety net for unsampled N0, plus exact-row exceptions where that
         // default is insufficient. Both are gated by the real-token floor
-        // (TUNE_FLOOR).
+        // (TUNE_FLOOR). Fed only by the mm range (tokens > 8) so it emits exactly the
+        // pre-E6 table; the [2,8] points feed only the switch analysis below.
         std::vector<std::string> rows_out;
         char rbuf[256];
+        // tok0 tiles captured for the E6 switch analysis (L2 default + L1 exceptions)
+        int tok0_L2 = base_i;                 // token-bucket-0 default cfg index
+        std::unordered_map<int,int> tok0_L1;  // N0_b -> exact cfg index
         std::set<int> token_buckets;
-        for (const auto & p : pts) { token_buckets.insert(tok_bkt(p.tokens)); }
+        for (const auto & p : pts) { if (p.tokens > NE11_MM_MIN_DEFAULT) { token_buckets.insert(tok_bkt(p.tokens)); } }
         for (int tb : token_buckets) {
             std::vector<const pt_t *> db;
             for (const auto & p : pts) {
-                if (tok_bkt(p.tokens) == tb) { db.push_back(&p); }
+                if (p.tokens > NE11_MM_MIN_DEFAULT && tok_bkt(p.tokens) == tb) { db.push_back(&p); }
             }
             if (db.empty()) { continue; }
 
@@ -9871,11 +9916,13 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                     mm_tile_dtype_enum_name(dt), tb, cfgs[bestD].first, cfgs[bestD].second);
                 rows_out.emplace_back(rbuf);
             }
+            if (tb == 0) { tok0_L2 = bestD; }  // capture tok0 default tile for the E6 switch analysis
             for (const auto & _b : bks) {
                 const bkt_t * b = &_b;
                 if (reg_pw(b, bestD) <= TUNE_TAU && b->agg[bestD]/b->base_agg - 1.0 <= TUNE_TAU) { continue; }
                 // exception = L1 exact bucket: (N0_b, tokens_b)
                 sanity_row(b->bp, b->Ti, "L1");
+                if (tb == 0) { tok0_L1[b->bN0] = b->Ti; }  // capture tok0 exact tile
                 snprintf(rbuf, sizeof(rbuf),
                     "    { { GGML_METAL_DEVICE_M4_MAX, %s, %d, %d, {0,0,0,0} }, { %d, %d } },",
                     mm_tile_dtype_enum_name(dt), b->bN0, tb, cfgs[b->Ti].first, cfgs[b->Ti].second);
@@ -9884,6 +9931,61 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
         }
         printf("\n    // ---- %s: %zu rows ----\n", ggml_type_name(dt), rows_out.size());
         for (const auto & r : rows_out) { printf("%s\n", r.c_str()); }
+
+        // ---- per-(dtype, N0-bucket) mv_ext->mm switch point (E6) ----
+        // Additive: the tile table above is unchanged (fed only by t>8); here we pick
+        // which small batches to route into the existing tok0 tiles. Per (N0 bucket, t),
+        // take the worst-case (min over shapes) mv_ext_t / tok0_tile_t (tile = production
+        // pick, L1->L2->baseline) and route only if it clears TUNE_SWITCH_MARGIN at every
+        // shape. Switch point = bottom of the contiguous safe run from t=8 (mm improves
+        // with t). Bucket 0 (narrow N0) never routes; default 8 = upstream dispatch.
+        auto tok0_tile_index = [&](int N0_b) {
+            auto it = tok0_L1.find(N0_b);
+            return it != tok0_L1.end() ? it->second : tok0_L2;
+        };
+        {
+            std::set<int> n0bs;
+            for (const auto & p : pts) { n0bs.insert(N0_bkt(p.N0)); }
+            std::set<int> sw_rows_b;
+            std::unordered_map<int,int> sw_by_b;
+            for (int b : n0bs) {
+                const int ti = tok0_tile_index(b);
+                printf("    // %s N0_b=%d tile=%dx%d mv_ext crossover:", ggml_type_name(dt), b,
+                       cfgs[ti].first, cfgs[ti].second);
+                std::unordered_map<int,bool> safe;
+                for (int t = 2; t <= NE11_MM_MIN_DEFAULT; ++t) {
+                    double min_ratio = 0.0; int n = 0;
+                    for (const auto & p : pts) {
+                        if (N0_bkt(p.N0) != b || p.tokens != t || p.mv_ext_t <= 0.0) { continue; }
+                        double tt = p.ts[ti];  // the production tok0 tile's time at this cell
+                        if (tt > 0.0) { double r = p.mv_ext_t / tt; min_ratio = (n==0)?r:std::min(min_ratio, r); n++; }
+                    }
+                    if (n == 0) { continue; }  // mv_ext does not apply at this (bucket, t)
+                    safe[t] = min_ratio >= 1.0 + TUNE_SWITCH_MARGIN;
+                    printf(" t%d=%.2f%s", t, min_ratio, safe[t] ? "" : "(mv)");
+                }
+                int sw = NE11_MM_MIN_DEFAULT;
+                for (int t = NE11_MM_MIN_DEFAULT; t >= 2; --t) {
+                    auto it = safe.find(t);
+                    if (it == safe.end()) { continue; }
+                    if (it->second) { sw = t - 1; } else { break; }
+                }
+                // K-series mv_ext starts at ne11=4, so sw>=3; a lower sw would move
+                // ne11 in {2,3} from mul_mv into mm (unmeasured). Enforced by
+                // mv_ext_applies leaving t<4 unsampled; assert it.
+                const bool k_series = (dt == GGML_TYPE_Q4_K);  // only K-series sweep dtype
+                GGML_ASSERT(!k_series || sw >= 3);
+                printf(" => ne11_mm_min=%d\n", sw);
+                if (sw < NE11_MM_MIN_DEFAULT) { sw_by_b[b] = sw; sw_rows_b.insert(b); }
+            }
+            if (!sw_rows_b.empty()) {
+                printf("    // %s switch-point rows {device, dtype, N0_b, ne11_mm_min}:\n", ggml_type_name(dt));
+                for (int b : sw_rows_b) {
+                    printf("    { GGML_METAL_DEVICE_M4_MAX, %s, %d, %d, {0,0,0,0} },\n",
+                           mm_tile_dtype_enum_name(dt), b, sw_by_b[b]);
+                }
+            }
+        }
     }
     return true;
 }
