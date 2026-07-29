@@ -9630,8 +9630,9 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
     // short-circuited region. When tuning a NEW device, temporarily re-add
     // {256, 512} here once to confirm the short-circuit holds before trusting it.
     // 96 and 192 give buckets [64,128) and [128,inf) >=2 sample points each. The low
-    // end [2,8] is the mv_ext->mm crossover zone (measured with the mm path forced,
-    // see set_sw below); it feeds only the switch point, not the tile table.
+    // end [2,8] is the range a lowered switch point can route into mm (measured with
+    // the mm path forced, see set_sw below); it is token bucket 0 and feeds both that
+    // bucket's tile and the switch point.
     const int tokens_full[]   = { 2, 3, 4, 5, 6, 7, 8, 9, 16, 24, 32, 48, 64, 96, 128, 192 };
 
     const double TUNE_TAU   = 0.05;
@@ -9639,14 +9640,17 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
     // A tile is emitted only if it never loses to baseline by >TUNE_FLOOR at a real
     // prefill token. Off-ladder tokens (9/24/48/96/192) still feed min-max-regret but
     // do not authorize a tile: baseline's period-32 tail-waste means a tile can win at
-    // t=48 yet lose at the t=32/64 the runtime visits. [2,8] does not feed the tile
-    // table (E6 keeps the P9 tiles); it only measures the mv_ext->mm crossover below.
+    // t=48 yet lose at the t=32/64 the runtime visits. [2,8] is contiguous on the
+    // ladder, so it authorizes the token-bucket-0 tile directly.
     const double TUNE_FLOOR = 0.02;
     // Conservative margin for the routing decision: route a small batch into mm only if
     // the tok0 tile beats mv_ext by this much at every shape (a near-tie stays mv_ext).
     const double TUNE_SWITCH_MARGIN = 0.05;
     auto is_real_token = [](int t) {
-        return t == 16 || t == 32 || t == 64 || t == 128;  // real prefill points on the ladder
+        // Tokens the runtime actually visits: [2,8] is contiguous on the ladder, so
+        // every point there is real (speculative decode, small-batch serving); above
+        // that only the powers of two are.
+        return (t >= 2 && t <= 8) || t == 16 || t == 32 || t == 64 || t == 128;
     };
     // occupancy-saturation threshold; keep in sync with MM_TILE_C_SAT_M4_MAX
     // (ggml-metal-tuning.h). Used only for emit-time sanity reporting below.
@@ -9768,19 +9772,19 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
         // neighbors); group_split finds one L2 default cfg (ANY,tok_b) as the
         // safety net for unsampled N0, plus exact-row exceptions where that
         // default is insufficient. Both are gated by the real-token floor
-        // (TUNE_FLOOR). Fed only by the mm range (tokens > 8) so it emits exactly the
-        // pre-E6 table; the [2,8] points feed only the switch analysis below.
+        // (TUNE_FLOOR). Bucket 0 ([2,8]) is tuned from the same ladder points that
+        // the switch analysis below then judges against mv_ext.
         std::vector<std::string> rows_out;
         char rbuf[256];
-        // tok0 tiles captured for the E6 switch analysis (L2 default + L1 exceptions)
+        // tok0 tiles captured for the switch analysis (L2 default + L1 exceptions)
         int tok0_L2 = base_i;                 // token-bucket-0 default cfg index
         std::unordered_map<int,int> tok0_L1;  // N0_b -> exact cfg index
         std::set<int> token_buckets;
-        for (const auto & p : pts) { if (p.tokens > NE11_MM_MIN_DEFAULT) { token_buckets.insert(tok_bkt(p.tokens)); } }
+        for (const auto & p : pts) { token_buckets.insert(tok_bkt(p.tokens)); }
         for (int tb : token_buckets) {
             std::vector<const pt_t *> db;
             for (const auto & p : pts) {
-                if (p.tokens > NE11_MM_MIN_DEFAULT && tok_bkt(p.tokens) == tb) { db.push_back(&p); }
+                if (tok_bkt(p.tokens) == tb) { db.push_back(&p); }
             }
             if (db.empty()) { continue; }
 
@@ -9932,11 +9936,11 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
         printf("\n    // ---- %s: %zu rows ----\n", ggml_type_name(dt), rows_out.size());
         for (const auto & r : rows_out) { printf("%s\n", r.c_str()); }
 
-        // ---- per-(dtype, N0-bucket) mv_ext->mm switch point (E6) ----
-        // Additive: the tile table above is unchanged (fed only by t>8); here we pick
-        // which small batches to route into the existing tok0 tiles. Per (N0 bucket, t),
-        // take the worst-case (min over shapes) mv_ext_t / tok0_tile_t (tile = production
-        // pick, L1->L2->baseline) and route only if it clears TUNE_SWITCH_MARGIN at every
+        // ---- per-(dtype, N0-bucket) mv_ext->mm switch point ----
+        // The tile for token bucket 0 was just emitted from the same [2,8] points; here
+        // we pick which small batches to route into it. Per (N0 bucket, t), take the
+        // worst-case (min over shapes) mv_ext_t / tok0_tile_t (tile = production pick,
+        // L1->L2->baseline) and route only if it clears TUNE_SWITCH_MARGIN at every
         // shape. Switch point = bottom of the contiguous safe run from t=8 (mm improves
         // with t). Bucket 0 (narrow N0) never routes; default 8 = upstream dispatch.
         auto tok0_tile_index = [&](int N0_b) {

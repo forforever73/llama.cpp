@@ -22,13 +22,17 @@ namespace ggml_metal_tuning {
 // Edge at 4608 splits the 3584/4096 cluster from 4608/5120: the crossover drifts with N0
 // (baseline threadgroup count -> occupancy), so 5120 must not inherit the 3584/4096 winner.
 constexpr int MM_TILE_N0_BUCKETS[]     = { 2048, 4608, 8192, 30000 };
-// token (ne11): 0=<32, 1=32-63, 2=64-127, 3=>=128. Split finely across the
+// token (ne11): 0=<9, 1=9-31, 2=32-63, 3=64-127, 4=>=128. Split finely across the
 // low-token range: the small-tile vs baseline crossover sits here and drifts
-// per (dtype,K,N0), so each side of it gets its own bucket to key a tuned row.
+// per (dtype,N0), so each side of it gets its own bucket to key a tuned row.
+// The edge at 9 separates the small-batch range that mm_tile_ne11_mm_min can route
+// into mm (ne11 <= 8) from the range that always used mm: nr1=8 pads half as much
+// as nr1=16 at ne11 <= 8, and the two swap ranking between 8 and 16, so one bucket
+// spanning both would serve the wrong tile to one of them.
 // There is no bucket above 128: mm_tile_pick short-circuits tokens >= 256 to
-// baseline (every tuned device converged to baseline there), so bucket-3 rows
+// baseline (every tuned device converged to baseline there), so bucket-4 rows
 // effectively serve [128,256). Keep that short-circuit in sync with this edge.
-constexpr int MM_TILE_TOKEN_BUCKETS[]  = { 32, 64, 128 };
+constexpr int MM_TILE_TOKEN_BUCKETS[]  = { 9, 32, 64, 128 };
 
 int mm_tile_N0_bucket(int64_t N_out);
 int mm_tile_token_bucket(int64_t tokens);
