@@ -785,9 +785,6 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
 }
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
-    // guard against a missing kernel: get_pipeline_* returns a nil pipeline (e.g. a
-    // tuned tile config with no instantiation), which would otherwise deref-crash here.
-    GGML_ASSERT(pipeline.pipeline != NULL && "compute pipeline not found (missing kernel instantiation?)");
     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
 }
 

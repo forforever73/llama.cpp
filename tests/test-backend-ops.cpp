@@ -9412,12 +9412,27 @@ using mm_tile_bucket_t         = int  (*)(int64_t);
 using mm_tile_selftest_t       = int  (*)(void);
 using set_ne11_mm_min_t        = void (*)(int);
 
-// The tile family (keep in sync with MM_TILE_FAMILY in ggml-metal-tuning.h):
-// 4 instantiated tiles, no 64x32. 64x32 is the baseline, served by the bare
+// The tile family: must match MM_TILE_FAMILY in ggml-metal-tuning.h (the single
+// source of truth; the third sync point is the INST_MM_TILE list in mul_mm.metal).
+// A tile missing here ships with no numerical or pipeline coverage while every gate
+// still reports pass. 64x32 is not a member: it is the baseline, served by the bare
 // kernel_mul_mm and guarded separately by run_mm_tile_drift_guard.
 static std::vector<std::pair<int,int>> mm_tile_legal_configs() {
     return { {32,8}, {32,16}, {64,8}, {64,16} };
 }
+
+// The tile-eligible src0 types: must match MM_TILE_DTYPES in ggml-metal-tuning.h.
+// A type missing here gets no numerical, drift or perf evidence while all the gates
+// still report pass; a type here that the backend does not accept never reaches a
+// tile, so the sweep would time the baseline four times over.
+static const ggml_type mm_tile_dtypes[] = {
+    GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16,
+};
+
+// The baseline tile: must match MM_TILE_BASELINE_CFG in ggml-metal-tuning.h; if
+// they diverge the sweep measures the wrong anchor and drift-guard stops covering
+// the bare kernel.
+static const std::pair<int,int> MM_TILE_BASELINE_LOCAL = { 64, 32 };
 
 // Structural gate for the pick lattice (L1 exact -> L2 N0-collapse -> L3
 // baseline). The backend runs the real lookup against a synthetic table and
@@ -9441,19 +9456,20 @@ static bool run_mm_tile_tune_check(ggml_backend_t backend_metal, ggml_backend_t 
     auto set_sw = (set_ne11_mm_min_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_mm_tile_ne11_mm_min_override");
     if (!set_ov || !clr_ov || !set_sw) { printf("metal mm_tile override proc unavailable\n"); return false; }
 
-    const ggml_type dtypes[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16 };
     const int K_pts[]      = { 64, 128, 4096, 4097, 14336 };  // 64/128=minimal, 4097=odd K
     // tokens straddle each bucket edge and cover [2,8] (routed into mm by a lowered
     // switch point); set_sw(1) below forces the mm path so the tile is exercised there.
-    const int tokens_pts[] = { 1, 2, 4, 5, 8, 9, 16, 32, 33 };
-    // M=4112 (%32=%64=%128=16): exercises the M-tail (partial-nr0 writeback) for all
-    // three NR0 tiles at once; the token points above cover the N-tail (%nr1 != 0).
+    // ne11=1 is excluded: it always lands on mul_mv, so the override would not reach
+    // the tile kernel (the regular MUL_MAT cases cover it).
+    const int tokens_pts[] = { 2, 4, 5, 8, 9, 16, 32, 33 };
+    // M=4112 (%32=%64=%128=16): exercises the M-tail (partial-nr0 writeback) for both
+    // NR0 tiles at once; the token points above cover the N-tail (%nr1 != 0).
     const int M = 4112;
 
     set_sw(1);  // route every ne11>=2 into mm so the tile override actually runs
     bool ok = true;
     int n_run = 0, n_fail = 0;
-    for (ggml_type dt : dtypes) {
+    for (ggml_type dt : mm_tile_dtypes) {
         for (int K : K_pts) {
             if (K % ggml_blck_size(dt) != 0) { continue; }  // skip K not aligned to the dtype block
             for (int tokens : tokens_pts) {
@@ -9477,28 +9493,30 @@ static bool run_mm_tile_tune_check(ggml_backend_t backend_metal, ggml_backend_t 
     return ok;
 }
 
-// Baseline drift-guard: the tile family no longer includes 64x32, so tune-check
-// (which iterates mm_tile_legal_configs) never exercises the bare kernel_mul_mm
-// path. Force the baseline cfg (routes to the bare kernel via unified naming) and
+// Baseline drift-guard: the tile family does not include 64x32 (the baseline is
+// served by the bare kernel_mul_mm), so tune-check never exercises that path.
+// Force the baseline cfg (routes to the bare kernel via unified naming) and
 // compare against CPU-ref to keep that path gated.
 static bool run_mm_tile_drift_guard(ggml_backend_t backend_metal, ggml_backend_t backend_cpu) {
     auto * reg  = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_metal));
     auto set_ov = (set_mm_tile_override_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_mm_tile_override");
     auto clr_ov = (clear_mm_tile_override_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_clear_mm_tile_override");
-    if (!set_ov || !clr_ov) { printf("metal mm_tile override proc unavailable\n"); return false; }
+    auto set_sw = (set_ne11_mm_min_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_mm_tile_ne11_mm_min_override");
+    if (!set_ov || !clr_ov || !set_sw) { printf("metal mm_tile override proc unavailable\n"); return false; }
 
-    const ggml_type dtypes[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16 };
     const int K_pts[]      = { 4096, 4097, 14336 };  // 4097 = odd K (bc_inp path)
     const int tokens_pts[] = { 8, 16, 33 };          // decode + batch, all %32 != 0 (N-tail)
     const int M = 4112;                              // %64=16 -> baseline M-tail
 
+    set_sw(1);  // route every ne11>=2 into mm; without this the switch-point table
+                // decides, and which cases reach the bare kernel drifts with the table
     bool ok = true;
     int n_run = 0, n_fail = 0;
-    for (ggml_type dt : dtypes) {
+    for (ggml_type dt : mm_tile_dtypes) {
         for (int K : K_pts) {
             if (K % ggml_blck_size(dt) != 0) { continue; }
             for (int tokens : tokens_pts) {
-                set_ov(64, 32);  // -> bare kernel_mul_mm
+                set_ov((int16_t) MM_TILE_BASELINE_LOCAL.first, (int16_t) MM_TILE_BASELINE_LOCAL.second);  // -> bare kernel_mul_mm
                 test_mul_mat tc(dt, GGML_TYPE_F32, M, tokens, K, {1,1}, {1,1});
                 auto st = tc.eval(backend_metal, backend_cpu, "MUL_MAT", nullptr);
                 clr_ov();
@@ -9511,6 +9529,7 @@ static bool run_mm_tile_drift_guard(ggml_backend_t backend_metal, ggml_backend_t
             }
         }
     }
+    set_sw(-1);  // restore the per-dtype switch-point table
     printf("mm_tile drift-guard (baseline 64x32): %d cases run, %d failed\n", n_run, n_fail);
     return ok;
 }
@@ -9571,6 +9590,46 @@ static double time_mm_cell_median(ggml_backend_t backend, const mm_perf_cell & c
     return samples[samples.size()/2] / cell.n_runs;
 }
 
+// Pipeline-completeness gate: dispatch one op for every (family tile, dtype) so each
+// combination has to resolve to a real pipeline. A family member added to
+// MM_TILE_FAMILY (and picked by a tuned row) but never instantiated via INST_MM_TILE
+// resolves to a nil pipeline, which nothing else catches until it reaches a user;
+// the numerical gates would only find it through their much slower CPU comparison.
+// The tile is forced, so the tuned table is irrelevant here - the coverage comes
+// from the family list itself.
+static bool run_mm_tile_pipeline_check(ggml_backend_t backend_metal) {
+    auto * reg  = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_metal));
+    auto set_ov = (set_mm_tile_override_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_mm_tile_override");
+    auto clr_ov = (clear_mm_tile_override_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_clear_mm_tile_override");
+    auto set_sw = (set_ne11_mm_min_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_mm_tile_ne11_mm_min_override");
+    if (!set_ov || !clr_ov || !set_sw) { printf("metal mm_tile override proc unavailable\n"); return false; }
+
+    // K=256 is block-aligned for every tile dtype; tokens=2 needs the forced mm path.
+    const int M = 64, K = 256, tokens = 2;
+
+    set_sw(1);
+    bool ok = true;
+    int n_run = 0, n_fail = 0;
+    for (ggml_type dt : mm_tile_dtypes) {
+        for (auto [nr0, nr1] : mm_tile_legal_configs()) {
+            set_ov((int16_t) nr0, (int16_t) nr1);
+            mm_perf_cell cell = mm_build_perf_cell(backend_metal, dt, M, K, tokens);
+            const bool cell_ok = cell.ok &&
+                ggml_backend_graph_compute(backend_metal, cell.gf) == GGML_STATUS_SUCCESS;
+            clr_ov();
+            if (!cell_ok) {
+                printf("FAIL pipeline dt=%s nr0=%d nr1=%d (missing INST_MM_TILE?)\n",
+                       ggml_type_name(dt), nr0, nr1);
+                ok = false; n_fail++;
+            }
+            n_run++;
+        }
+    }
+    set_sw(-1);
+    printf("mm_tile pipeline-check (family x dtype): %d combos run, %d failed\n", n_run, n_fail);
+    return ok;
+}
+
 // map a sweep dtype to its ggml_type enum spelling, for pasteable table rows
 static const char * mm_tile_dtype_enum_name(ggml_type dt) {
     switch (dt) {
@@ -9594,14 +9653,13 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
         return false;
     }
 
-    // sweep grid (P3, M4 Max): a shape-zoo of real model (K, N0) pairs sampled
+    // sweep grid (M4 Max): a shape-zoo of real model (K, N0) pairs sampled
     // against a token ladder. (K, N0) is sampled in PAIRS (not a cartesian grid)
     // because real weights only occupy a few diagonals of the (K, N0) plane
     // (proj / FFN-up / FFN-down / vocab); the off-diagonal cells are physically
     // absent shapes. K is not a table key (it scales all candidates equally and
     // never flips the ranking), but deep-K shapes stay in the zoo so the N0/token
     // aggregation sees their measurements instead of extrapolating.
-    const ggml_type dtypes[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16 };
 
     struct shape_t { int K, N0; };
     const shape_t zoo[] = {
@@ -9623,7 +9681,7 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
         { 32768, 512 }, { 24576, 1536 }, { 2048, 768 },
     };
     // token ladder: ends at 192. tokens >= 256 is short-circuited to baseline by
-    // mm_tile_pick (verified all-baseline at 256/512/2048 in the P4/P5 sweeps:
+    // mm_tile_pick (verified all-baseline at 256/512/2048 in earlier sweeps:
     // the baseline dispatch saturates the GPU there, so the top bucket never got
     // a row) — sampling it again each retune would spend most of the sweep's
     // wall-clock on its most expensive, throttle-prone cells to reconfirm a
@@ -9652,29 +9710,30 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
         // that only the powers of two are.
         return (t >= 2 && t <= 8) || t == 16 || t == 32 || t == 64 || t == 128;
     };
-    // occupancy-saturation threshold; keep in sync with MM_TILE_C_SAT_M4_MAX
-    // (ggml-metal-tuning.h). Used only for emit-time sanity reporting below.
+    // Occupancy-saturation threshold, used only for the emit-time sanity report below:
+    // must match MM_TILE_C_SAT_M4_MAX; a stale value makes the emit-time sanity report
+    // advise on the wrong occupancy threshold.
     const int64_t C_SAT = 144;
-    // upstream mv_ext->mm break-even default; keep in sync with
-    // NE11_MM_MIN_DEFAULT (ggml-metal-tuning.h). The switch-point sweep
-    // scans t in [2, NE11_MM_MIN_DEFAULT] for the per-dtype crossover.
+    // Upstream mv_ext->mm break-even default: must match MM_TILE_NE11_MM_MIN_DEFAULT;
+    // it bounds the switch-point scan and is the "no row" fallback.
     const int NE11_MM_MIN_DEFAULT = 8;
     auto n_tg_base = [](int64_t N0, int64_t tokens) {
         return ((N0 + 63) / 64) * ((tokens + 31) / 32);
     };
-    // family members + baseline (64x32) as the comparison anchor; the baseline is
-    // measured via set_override -> bare kernel_mul_mm, so it must be a candidate here
-    // even though it is not a tune-check family member.
+    // family members + baseline as the comparison anchor; the baseline is measured
+    // via set_override -> bare kernel_mul_mm, so it must be a candidate here even
+    // though it is not a tune-check family member.
     std::vector<std::pair<int,int>> cfgs = mm_tile_legal_configs();
-    cfgs.push_back({ 64, 32 });
+    cfgs.push_back(MM_TILE_BASELINE_LOCAL);
     const int    base_i = [&]() {
         for (int i = 0; i < (int)cfgs.size(); ++i) {
-            if (cfgs[i].first == 64 && cfgs[i].second == 32) { return i; }
+            if (cfgs[i] == MM_TILE_BASELINE_LOCAL) { return i; }
         }
         return 0;
     }();
 
-    printf("# mm_tile perf sweep — replace GGML_METAL_DEVICE_M4_MAX with this machine's device\n");
+    const char * dev_desc = ggml_backend_dev_description(ggml_backend_get_device(backend_metal));
+    printf("# mm_tile perf sweep on \"%s\"\n", dev_desc);
     printf("# Format: nr0xnr1=time_us* (* = winner); => cfg NR0xNR1 beats baseline, else => baseline\n");
     printf("# mv_ext=time_us shown for t<=8 (mm-vs-mv_ext crossover for the per-dtype switch point)\n");
 
@@ -9691,8 +9750,13 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
         return k_series ? (t >= 4) : true;                 // K-series mv_ext starts at 4
     };
 
-    for (ggml_type dt : dtypes) {
+    for (ggml_type dt : mm_tile_dtypes) {
         printf("\n### dtype=%s\n", ggml_type_name(dt));
+        // The rows below are emitted with a fixed device enum. Nothing checks that it
+        // matches the machine the sweep ran on, and pasting a foreign device's rows
+        // hands them to that device's users, so repeat the warning per dtype block.
+        printf("# WARNING: rows are emitted as GGML_METAL_DEVICE_M4_MAX but were measured on\n"
+               "#          \"%s\" - replace the device enum in every row unless they match.\n", dev_desc);
 
         struct pt_t { int K, N0, tokens; std::vector<double> ts; double base_t; double mv_ext_t; };
         std::vector<pt_t> pts;
@@ -9721,7 +9785,7 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                     clr_ov();
                     if (idx % 3 == 0) {
                         // baseline re-measure for throttle detection
-                        set_ov(64, 32);
+                        set_ov((int16_t) MM_TILE_BASELINE_LOCAL.first, (int16_t) MM_TILE_BASELINE_LOCAL.second);
                         double a = time_mm_cell_median(backend_metal, cell, reps);
                         clr_ov();
                         if (anchor > 0.0) {
@@ -9920,7 +9984,7 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                     mm_tile_dtype_enum_name(dt), tb, cfgs[bestD].first, cfgs[bestD].second);
                 rows_out.emplace_back(rbuf);
             }
-            if (tb == 0) { tok0_L2 = bestD; }  // capture tok0 default tile for the E6 switch analysis
+            if (tb == 0) { tok0_L2 = bestD; }  // capture tok0 default tile for the mv_ext->mm switch analysis
             for (const auto & _b : bks) {
                 const bkt_t * b = &_b;
                 if (reg_pw(b, bestD) <= TUNE_TAU && b->agg[bestD]/b->base_agg - 1.0 <= TUNE_TAU) { continue; }
@@ -9971,12 +10035,12 @@ static bool run_mm_tile_tune_perf(ggml_backend_t backend_metal) {
                 int sw = NE11_MM_MIN_DEFAULT;
                 for (int t = NE11_MM_MIN_DEFAULT; t >= 2; --t) {
                     auto it = safe.find(t);
-                    if (it == safe.end()) { continue; }
+                    if (it == safe.end()) { break; }  // gap in the ladder ends the run
                     if (it->second) { sw = t - 1; } else { break; }
                 }
                 // K-series mv_ext starts at ne11=4, so sw>=3; a lower sw would move
-                // ne11 in {2,3} from mul_mv into mm (unmeasured). Enforced by
-                // mv_ext_applies leaving t<4 unsampled; assert it.
+                // ne11 in {2,3} from mul_mv into mm (unmeasured). mv_ext_applies leaves
+                // t<4 unsampled and the loop above stops at that gap; assert it.
                 const bool k_series = (dt == GGML_TYPE_Q4_K);  // only K-series sweep dtype
                 GGML_ASSERT(!k_series || sw >= 3);
                 printf(" => ne11_mm_min=%d\n", sw);
@@ -10139,16 +10203,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type type_a : all_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
-            }
-        }
-    }
-
-    // [PoC] mul_mm tile go/no-go sweep: m=4032 (=63*64) marks these cases for -p "m=4032".
-    // Run once each under GGML_MM_TILE=base|nr8|nr16 to compare NR1 tiles across dtype x n(=ne11) x K.
-    for (int k : {4096, 14336}) {
-        for (int n : {4, 6, 8, 12, 16, 24, 32, 48}) {
-            for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16}) {
-                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4032, n, k, {1, 1}, {1, 1}));
             }
         }
     }
@@ -10408,12 +10462,13 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         const bool ok = g_mm_tune_perf
             ? run_mm_tile_tune_perf(backend)
             : [&]() {
-                  // run all three under plain `tune`: lattice structure, family
-                  // numerics, and baseline drift-guard
+                  // run all four under plain `tune`: lattice structure, pipeline
+                  // completeness, family numerics, and baseline drift-guard
                   const bool ok_lat   = run_mm_tile_lattice_check(backend);
+                  const bool ok_ppl   = run_mm_tile_pipeline_check(backend);
                   const bool ok_check = run_mm_tile_tune_check(backend, backend_cpu);
                   const bool ok_drift = run_mm_tile_drift_guard(backend, backend_cpu);
-                  return ok_lat && ok_check && ok_drift;
+                  return ok_lat && ok_ppl && ok_check && ok_drift;
               }();
         ggml_backend_free(backend_cpu);
         return ok;
@@ -10711,6 +10766,7 @@ static void usage(char ** argv) {
     printf("      - grad (compare gradients from backpropagation with method of finite differences)\n");
     printf("      - perf (performance evaluation)\n");
     printf("      - support (probe backend operation support)\n");
+    printf("      - tune (build the mul_mm tile lookup table; --tune-perf runs the raw sweep)\n");
     printf("    op names for -o are as given by ggml_op_desc() (e.g. ADD, MUL_MAT, etc),\n");
     printf("        optionally including the full test case string (e.g. \"ADD(type=f16,ne=[1,1,8,1],nr=[1,1,1,1],nf=1)\")\n");
     printf("    --output specifies output format (default: console, options: console, sql, csv)\n");
@@ -10801,6 +10857,12 @@ int main(int argc, char ** argv) {
             usage(argv);
             return 1;
         }
+    }
+
+    if (g_mm_tune_perf && mode != MODE_TUNE) {
+        printf("--tune-perf is only valid in tune mode\n");
+        usage(argv);
+        return 1;
     }
 
     // load and enumerate backends

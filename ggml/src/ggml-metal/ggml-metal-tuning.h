@@ -29,45 +29,66 @@ constexpr int MM_TILE_N0_BUCKETS[]     = { 2048, 4608, 8192, 30000 };
 // into mm (ne11 <= 8) from the range that always used mm: nr1=8 pads half as much
 // as nr1=16 at ne11 <= 8, and the two swap ranking between 8 and 16, so one bucket
 // spanning both would serve the wrong tile to one of them.
-// There is no bucket above 128: mm_tile_pick short-circuits tokens >= 256 to
-// baseline (every tuned device converged to baseline there), so bucket-4 rows
-// effectively serve [128,256). Keep that short-circuit in sync with this edge.
+// There is no bucket above 128: mm_tile_pick short-circuits tokens >=
+// MM_TILE_TOKENS_MAX_TUNED to baseline (every tuned device converged to baseline
+// there), so bucket-4 rows effectively serve [128, MM_TILE_TOKENS_MAX_TUNED).
 constexpr int MM_TILE_TOKEN_BUCKETS[]  = { 9, 32, 64, 128 };
 
 int mm_tile_N0_bucket(int64_t N_out);
 int mm_tile_token_bucket(int64_t tokens);
 
-// default cfg used when no tuned row matches
 struct mm_tile_cfg_t {
     int16_t nr0;  // 32, 64, or 128 (int16: 128 exceeds int8_t range)
     int16_t nr1;  //  8, 16, or  32
 };
 
 // Single source of truth for the instantiated tile variants in mul_mm.metal.
-// Tuned-table rows are static_assert'd to be a family member or the baseline,
-// and run_mm_tile_tune_check exercises every member. 64x32 is NOT a family
-// member; it is the baseline, served by the bare kernel_mul_mm.
+// Three places must agree: this list, the INST_MM_TILE instantiations in
+// mul_mm.metal, and mm_tile_legal_configs in tests/test-backend-ops.cpp (which
+// drives the numerical and pipeline gates). Tuned-table rows are static_assert'd
+// to be a family member or the baseline. 64x32 is NOT a family member; it is the
+// baseline, served by the bare kernel_mul_mm.
 // 128x16/128x32 were instantiated during tuning but no tuned row on any device
-// picked them (metallib/compile-time dead weight); re-add here, in
-// mul_mm.metal, and in mm_tile_legal_configs when retuning a new device.
+// picked them (metallib/compile-time dead weight); re-add in all three places
+// when retuning a new device.
 constexpr mm_tile_cfg_t MM_TILE_FAMILY[] = {
     { 32, 8 }, { 32, 16 }, { 64, 8 }, { 64, 16 },
 };
 constexpr mm_tile_cfg_t MM_TILE_BASELINE_CFG = { 64, 32 };
+
+// Single source of truth for the tile-eligible src0 types: the tile kernel is only
+// instantiated for these (see INST_MM_TILE in mul_mm.metal), so a type missing here
+// can never reach a tile, and a type here without an instantiation would resolve to
+// a nil pipeline.
+constexpr ggml_type MM_TILE_DTYPES[] = {
+    GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16,
+};
 
 // Occupancy-saturation threshold for the pick-time veto, measured in baseline
 // (64x32) threadgroup count: n_tg = ceil(N_out/64) * ceil(tokens/32). Once the
 // baseline dispatch alone saturates the GPU (n_tg >= C_sat), a smaller tile has
 // no occupancy headroom left to win, so any non-baseline table row is overridden
 // back to baseline. This bounds table extrapolation error on shapes the sweep
-// never sampled. tokens < 32 is exempt: those wins come from baseline's token
-// padding + bc_out slow path, which persist at any occupancy.
+// never sampled. Below MM_TILE_OCCUPANCY_MIN_TOKENS the veto is exempt: those
+// wins come from baseline's token padding + bc_out slow path, which persist at
+// any occupancy.
 // Calibrated on M4 Max (40 cores x ~3.6 concurrent tg/core; accuracy is flat
 // for C_sat in [128,160]). Per-device data like the tuned table: recalibrate
 // when adding rows for a new device. Overestimating C_sat degrades to pure
 // table behavior; underestimating only forfeits small-tile wins - neither
 // direction can pick something slower than baseline.
+// A single M4 Max slot suffices structurally: the veto only fires when a tuned
+// row was found, and rows match on exact device_id, so no other device can ever
+// consult this constant.
 constexpr int MM_TILE_C_SAT_M4_MAX = 144;
+
+// Veto exemption edge, tied to the token bucket that separates the padding-driven
+// wins from the occupancy-driven ones.
+constexpr int MM_TILE_OCCUPANCY_MIN_TOKENS = MM_TILE_TOKEN_BUCKETS[1];
+
+// Above this the pick short-circuits to baseline. A measured result (every tuned
+// device converged to baseline there), not an edge derived from the bucket list.
+constexpr int MM_TILE_TOKENS_MAX_TUNED = 256;
 
 // Tuned table has two row kinds.
 // Exact rows key a (N0_b, tokens_b) bucket.
@@ -96,7 +117,6 @@ struct mm_tile_entry_t {
 // test/tune-only override; when set, mm_tile_pick returns it directly.
 void           mm_tile_set_override(mm_tile_cfg_t cfg);
 void           mm_tile_clear_override();
-bool           mm_tile_override_active();
 mm_tile_cfg_t  mm_tile_baseline_cfg();
 
 // Returns (64,32) unless a tuned row matches.
@@ -105,23 +125,26 @@ mm_tile_cfg_t  mm_tile_pick(enum ggml_metal_device_id device_id,
                              int64_t N_out,
                              int64_t tokens);
 
-// Default mv-ext -> mm break-even: ne11 > this uses mm, ne11 in [.,8] uses mv_ext.
+// Upstream mv_ext -> mm break-even, and the clamp for the tuned values below.
 constexpr int MM_TILE_NE11_MM_MIN_DEFAULT = 8;
 
 // Per-device/(dtype, N0-bucket) break-even: the small-batch mm tile can beat mv_ext
-// below 8, but only at large N0 (small N0 lacks the occupancy for mm), so it is
-// keyed on N0 bucket. Returns MM_TILE_NE11_MM_MIN_DEFAULT (untuned -> upstream
-// dispatch), clamped to it (may only lower the boundary; ne11>8 in mv_ext aborts).
-// Exact device only, like the t>=32 tile rows (crossover scales with core count).
+// below the default, but only at large N0 (small N0 lacks the occupancy for mm), so
+// it is keyed on N0 bucket. Returned V is the upper bound of the mv_ext window:
+// ne11 in [2,V] uses mv_ext, ne11 > V uses mm. Clamped to (and defaulting to)
+// MM_TILE_NE11_MM_MIN_DEFAULT because mv_ext aborts above it, so an untuned
+// (device, dtype, N0) keeps the upstream dispatch. Exact device only, like the
+// tile table.
 int            mm_tile_ne11_mm_min(enum ggml_metal_device_id device_id, int dtype, int64_t N_out);
 
 // tune-only override for mm_tile_ne11_mm_min; -1 clears it (forces the mm path so
 // the sweep can measure mm-tile vs mv_ext in the [2,8] range).
 void           mm_tile_set_ne11_mm_min_override(int ne11_mm_min);
 
-// Self-test for the pick lattice (L1 exact -> L2 N0-collapse -> L3 baseline).
-// Runs the real lookup against a synthetic table; returns the number of failed
-// assertions (0 = pass). Wired into `tune`.
+// Self-test for the pick lattice (L1 exact -> L2 N0-collapse -> L3 baseline) and
+// for mm_tile_pick's short-circuit and occupancy veto. Runs the real lookup
+// against a synthetic table, then mm_tile_pick against the tuned one; returns the
+// number of failed assertions (0 = pass). Wired into `tune`.
 int            mm_tile_lattice_selftest();
 
 }  // namespace ggml_metal_tuning

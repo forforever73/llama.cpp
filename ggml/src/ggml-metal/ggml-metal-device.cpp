@@ -715,18 +715,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
     constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
 
-    const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
+    const auto * dev_props  = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+    const bool   has_tensor = dev_props->has_tensor;
 
     // Pick (nr0, nr1) from the tuning table; falls back to (64,32) baseline.
-    // The tile kernel is only compiled for the non-tensor path, the four sweep dtypes, and src1=f32.
-    const bool tile_eligible = !has_tensor && tsrc1 == GGML_TYPE_F32 &&
-        (tsrc0 == GGML_TYPE_Q4_0 || tsrc0 == GGML_TYPE_Q8_0 ||
-         tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_F16);
-    const auto * dev_props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+    // The tile kernel is only compiled for the non-tensor path, MM_TILE_DTYPES, and src1=f32.
+    bool tile_dtype = false;
+    for (ggml_type t : ggml_metal_tuning::MM_TILE_DTYPES) {
+        if (tsrc0 == t) { tile_dtype = true; break; }
+    }
+    const bool tile_eligible = !has_tensor && tsrc1 == GGML_TYPE_F32 && tile_dtype;
 
     // pick returns a legal cfg: tuned-table rows are static_assert'd legal and the
-    // baseline (64x32) is legal. name/grid/smem are all derived from this one cfg,
-    // so they can never desync (mirrors fa_vec's _q%d_ne%d suffix).
+    // baseline is legal. name/grid/smem are all derived from this one cfg, so they
+    // can never desync.
     const ggml_metal_tuning::mm_tile_cfg_t cfg = tile_eligible
         ? ggml_metal_tuning::mm_tile_pick(
               dev_props->device_id,
@@ -748,9 +750,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    // baseline (64x32) -> plain kernel_mul_mm; any other tile appends _tile_{nr0}x{nr1}.
+    // baseline -> plain kernel_mul_mm; any other tile appends _tile_{nr0}x{nr1}.
     char tile_suffix[16] = {0};
-    if (!(nr0 == 64 && nr1 == 32)) {
+    if (nr0 != ggml_metal_tuning::MM_TILE_BASELINE_CFG.nr0 ||
+        nr1 != ggml_metal_tuning::MM_TILE_BASELINE_CFG.nr1) {
         snprintf(tile_suffix, sizeof(tile_suffix), "_tile_%dx%d", nr0, nr1);
     }
     snprintf(base, 256, "kernel_mul_mm%s_%s_%s", tile_suffix,
@@ -784,7 +787,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     } else {
         res.nr0 = nr0;
         res.nr1 = nr1;
-        res.nsg = nr0 / 16;  // 32->2, 64->4, 128->8 (== baseline 4 at nr0=64)
+        res.nsg = nr0 / 16;  // must match N_SG in kernel_mul_mm_tile
 
         // smem = max(sa+sb, bc_out buffer): the writeback path reuses shmem as a
         // NR0 x NR1 float scratch, which can exceed the sa+sb load buffers for large tiles.

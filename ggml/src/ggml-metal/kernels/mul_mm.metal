@@ -366,8 +366,9 @@ kernel void kernel_mul_mm_tile(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    // layout constants derived from (NR0, NR1)
-    constexpr short N_SG = (NR0 == 128) ? 8 : (NR0 == 32) ? 2 : 4;
+    // layout constants derived from (NR0, NR1). res.nsg on the host side must use
+    // the same expression as N_SG, or the launch geometry desyncs from the indexing.
+    constexpr short N_SG = NR0 / 16;
     constexpr short SG_N = (NR1 == 32)  ? 2 : 1;
     constexpr short SG_M = N_SG / SG_N;
     constexpr short TM   = NR0 / (SG_M * 8);
@@ -381,6 +382,9 @@ kernel void kernel_mul_mm_tile(
     constexpr short SA_RB = NR0 / 8;
     // B-tile shared-memory block stride (col-block count); parameterized on NR1
     constexpr short SB_CB = NR1 / 8;
+
+    static_assert(NR0 % 16 == 0 && NR1 % 8 == 0 && 2*NR1 <= NR0,
+                  "tile geometry: the 32*N_SG threads must cover every B-tile block");
 
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
     threadgroup S1 * sb = (threadgroup S1 *)(shmem + NR0 * NK * sizeof(S0));
@@ -963,9 +967,13 @@ template [[host_name("kernel_mul_mm_iq4_xs_f16")]]  kernel mul_mm_t kernel_mul_m
 #ifndef GGML_METAL_HAS_TENSOR
 // [autotune] tile family — 4 instantiated tiles (no 64x32: the baseline is served
 // by the bare kernel_mul_mm) x {q4_0,q8_0,q4_K,f16} x f32.
+// Single source of truth = MM_TILE_FAMILY in ggml-metal-tuning.h. Three places must
+// agree: that list, the INST_MM_TILE instantiations below, and mm_tile_legal_configs
+// in tests/test-backend-ops.cpp (which drives the numerical and pipeline gates).
+// A tile in the table but not instantiated here resolves to a nil pipeline; a tile
+// instantiated here but absent from the test list ships without coverage.
 // 128x16/128x32 were instantiated during tuning but no tuned row on any device
-// picked them; re-add here and in MM_TILE_FAMILY when retuning a new device.
-// Keep in sync with MM_TILE_FAMILY; run_mm_tile_tune_check exercises every member.
+// picked them; re-add in all three places when retuning a new device.
 // The typedef only names the (NR0/NR1-independent) kernel function type.
 typedef decltype(kernel_mul_mm_tile<
     half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8,
